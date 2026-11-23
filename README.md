@@ -1,6 +1,6 @@
 # The Day Trader skill, India
 
-11 Claude skills for day trading Indian stocks on NSE: scan the market for setups, track news and filings, time every entry and exit, and replay every outcome before you risk a rupee.
+12 Claude skills for day trading Indian stocks on NSE: scan the market for setups, track news and filings, time every entry and exit, replay every outcome before you risk a rupee, and score your practice trades after charges.
 
 Free, MIT, no signup, no API key. The tools are plain Python that read free
 public data: Yahoo Finance charts and quarterly figures for NSE symbols,
@@ -45,7 +45,7 @@ method works.
 The tools need Python 3.8 or newer. Nothing to pip install. On Windows the
 command is `python`; on macOS and Linux it is usually `python3`.
 
-## The eleven
+## The twelve
 
 | command | job | what it does |
 | --- | --- | --- |
@@ -60,6 +60,7 @@ command is `python`; on macOS and Linux it is usually `python3`.
 | `/trader-alerts` | Price Alerts | Rings when a price, a stop, the opening bell or your flat-by time hits. |
 | `/trader-analyst` | Earnings Analyst | Lines up a company's quarterly revenue, profit and EPS and says what changed. |
 | `/trader-insider` | Insider and Big-Deals Tracker | Reads NSE's bulk and block deals and the insider-trading and takeover disclosures as they are published. |
+| `/trader-journal` | Practice Journal | Scores every practice trade against what the price really did, after brokerage and taxes, and keeps the scoreboard. |
 
 The original's earnings analyst read SEC filings and its eleventh skill
 tracked US Congress trade disclosures. Here the analyst reads Yahoo's
@@ -75,6 +76,7 @@ what the last one wrote:
 ```
 scanner -> news -> entry -> exit -> timemachine -> budget -> risk -> broker   (one trade)
 alerts: stop, target, flat by 3:00 PM                                         (while it is open)
+journal: score it after the close, read the scoreboard                        (every day)
 news / analyst / insider                                                      (on a schedule)
 ```
 
@@ -137,6 +139,9 @@ python trader-alerts/alerts.py add --from-plan                        # stop, ta
 python trader-alerts/alerts.py check                                  # rings what hit, once
 python trader-analyst/facts.py TCS                                    # quarters, growth, EPS
 python trader-insider/deals.py new                                    # new deals and disclosures
+python trader-journal/journal.py charges --plan                       # what the plan costs in charges
+python trader-journal/journal.py score                                # score the day's trades
+python trader-journal/journal.py report                               # the scoreboard
 ```
 
 ```bash
@@ -188,9 +193,12 @@ reality check, never as a promise.
 stop order can fill well past its price. The max loss shown is the loss at
 the stop price, before charges.
 
-**Charges are not modelled.** Every intraday trade pays brokerage, STT,
-exchange and SEBI charges, stamp duty and GST. On a small position these can
-be a large part of a 1R target. Check your broker's charges calculator.
+**Charges.** Every intraday trade pays brokerage, STT, exchange and SEBI
+charges, stamp duty and GST. On a small position these can be a large part
+of a 1R target. The sizing, risk and Time Machine figures are before
+charges; `/trader-journal` works them out, using Groww's published rates by
+default (set your own broker's in `trader/config.json`). Your contract note
+is the final word.
 
 **Auto square-off.** Brokers close intraday positions for you some minutes
 before the close (commonly between 3:10 PM and 3:20 PM) and charge for it.
@@ -248,6 +256,7 @@ trader-broker/      SKILL.md, ticket.py
 trader-alerts/      SKILL.md, alerts.py, alerts.example.json
 trader-analyst/     SKILL.md, facts.py, metrics.example.json
 trader-insider/     SKILL.md, deals.py
+trader-journal/     SKILL.md, journal.py
 tests/              unittest suite + offline fixtures
 ```
 

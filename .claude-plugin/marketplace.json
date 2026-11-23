@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "day-trader-skill-india",
-      "description": "Eleven Claude skills for day trading NSE stocks: a chart scanner, a news and filings monitor, an entry timer, an exit planner, a time machine that replays 10,000 sessions, a risk manager, a budget manager, an order ticket you enter yourself in your broker app, price alerts, an earnings analyst and an insider and big-deals tracker. Rupees, IST and NSE hours. Nothing places an order for you.",
+      "description": "Twelve Claude skills for day trading NSE stocks: a chart scanner, a news and filings monitor, an entry timer, an exit planner, a time machine that replays 10,000 sessions, a risk manager, a budget manager, an order ticket you enter yourself in your broker app, price alerts, an earnings analyst, an insider and big-deals tracker, and a practice journal that scores every trade after charges. Rupees, IST and NSE hours. Nothing places an order for you.",
       "source": "./",
       "category": "productivity",
       "homepage": "https://github.com/siddharthprakash1/day-trader-skill-india"

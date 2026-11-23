@@ -1,7 +1,7 @@
 {
   "name": "day-trader-skill-india",
-  "description": "11 Claude skills for day trading Indian stocks on NSE: scan the market for setups, track news and filings, time every entry and exit, and replay every outcome before you risk a rupee.",
-  "version": "1.1.0",
+  "description": "12 Claude skills for day trading Indian stocks on NSE: scan the market for setups, track news and filings, time every entry and exit, replay every outcome before you risk a rupee, and score your practice trades after charges.",
+  "version": "1.2.0",
   "author": {
     "name": "siddharthprakash1",
     "url": "https://github.com/siddharthprakash1"
