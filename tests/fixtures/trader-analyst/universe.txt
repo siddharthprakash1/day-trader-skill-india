@@ -1,0 +1,13 @@
+FUSION|Fusion Finance Limited
+FUSIONCX|Fusion CX Limited
+HDFCBANK|HDFC Bank Limited
+INFY|Infosys Limited
+M&M|Mahindra & Mahindra Limited
+PASHUPATI|Pashupati Cotspin Limited
+RELIANCE|Reliance Industries Limited
+SBIN|State Bank of India
+TCS|Tata Consultancy Services Limited
+TMCV|Tata Motors Limited
+TMPV|Tata Motors Passenger Vehicles Limited
+VRAJ|Vraj Iron and Steel Limited
+ZEEL|Zee Entertainment Enterprises Limited

@@ -30,6 +30,22 @@ daily     Pre-market scan of daily CLOSES (Yahoo spark: 20 symbols a request,
             oversold         RSI 14 (Wilder) under 30
             oversold_bounce  RSI 14 was under 30 yesterday and today closed up
           Today's daily bar is dropped until the session's close (15:30 IST).
+          NSE's own files for the latest completed session (plain downloads
+          from nsearchives.nseindia.com, one request each, kept in
+          trader/state/): the full bhavcopy sec_bhavdata_full_DDMMYYYY.csv
+          gives the official close (CLOSE_PRICE) and volume (TTL_TRD_QNTY) of
+          that day where Yahoo's daily bar is still empty, and each hit's
+          delivery % and turnover in crore; fo_secban.csv flags a hit in the
+          F&O ban period; CM_52_wk_High_low_DDMMYYYY.csv tags a hit within
+          2 % of its 52-week high. If the bhavcopy is not out yet (a 404: NSE
+          publishes it in the evening) the session's last traded price from
+          Yahoo stands in for the close, and the scan says so. --nse DIR
+          reads saved copies, --no-nse skips them.
+
+universe --index nifty500
+          NSE's Nifty 500 list (ind_nifty500list.csv) instead of every EQ
+          stock: a liquid universe. Also writes trader/state/industry.json
+          (SYMBOL -> industry); daily prints a hit's industry when it is there.
 
 orb       Opening-range breakouts, 5-minute bars. The range is the first
           --or-minutes (15) of the session: the 09:15, 09:20 and 09:25 bars.
@@ -99,6 +115,16 @@ BAR_MIN = 5
 MAX_CONFIRM = 200   # stage-2 v8 charts per orb scan, most traded first
 MIN_DAILY_BARS = 30
 DEFAULT_UNIVERSE = "trader/universe.txt"
+# NSE's openly published daily files (plain GETs on the archive host, never the website's API)
+NSE_BASE = "https://nsearchives.nseindia.com/"
+BHAV_DIR, BHAV_NAME = "products/content/", "sec_bhavdata_full_%s.csv"   # %s = DDMMYYYY
+HILO_DIR, HILO_NAME = "content/", "CM_52_wk_High_low_%s.csv"
+BAN_DIR, BAN_NAME = "content/fo/", "fo_secban.csv"
+INDEX_LISTS = {"nifty500": ("content/indices/", "ind_nifty500list.csv", "Nifty 500")}
+INDUSTRY_FILE = "industry.json"   # in trader/state/
+NSE_PAUSE = 0.5       # seconds between two requests to NSE's host, at least
+NEAR_HIGH_PCT = 2.0   # near_52w_high: the close is within this of the 52-week high, or above it
+MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
 NOTE = "A scan is a list of charts that match a rule, not a list of stocks to buy."
 
 # NSE trading holidays, capital market segment (NSE circular of 12 Dec 2025).
@@ -203,6 +229,23 @@ def session(d):
     if not ok:
         return None
     return OPEN, CLOSE
+
+
+def prev_trading_day(d):
+    d -= datetime.timedelta(days=1)
+    while not trading_day(d)[0]:
+        d -= datetime.timedelta(days=1)
+    return d
+
+
+def latest_session(now_utc):
+    """The date of the latest COMPLETED NSE session at this clock: today from 15:30 IST
+    on a trading day, else the trading day before."""
+    now = to_ist(now_utc)
+    s = session(now.date())
+    if s and now.time() >= s[1]:
+        return now.date()
+    return prev_trading_day(now.date())
 
 
 def clock_label(t):
@@ -453,6 +496,227 @@ def fetch_equity_list(pause=PAUSE):
                     "(Market Data > Securities Available for Trading) and pass --offline FILE." % (NSE_LIST, last))
 
 
+# ---------------------------------------------------------------- NSE's daily files
+
+def _num(text):
+    """'  8230.00' -> 8230.0; '-' or '' -> None."""
+    t = (text or "").strip().replace(",", "")
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def nse_date(text):
+    """'23-Nov-2026' or '25-NOV-2026' -> date, or None."""
+    m = re.match(r"^\s*(\d{1,2})-([A-Za-z]{3})-(\d{4})\s*$", text or "")
+    if not m or m.group(2).upper() not in MONTHS:
+        return None
+    try:
+        return datetime.date(int(m.group(3)), MONTHS.index(m.group(2).upper()) + 1, int(m.group(1)))
+    except ValueError:
+        return None
+
+
+def _csv_rows(text):
+    return [[c.strip() for c in r] for r in csv.reader(io.StringIO(text.lstrip("﻿").replace("\r", "")))
+            if any(c.strip() for c in r)]
+
+
+def parse_bhavcopy(text):
+    """NSE's full bhavcopy (sec_bhavdata_full_DDMMYYYY.csv) -> (session date, {SYM: row}),
+    series EQ rows only. A row is {"close", "volume", "turnover_cr", "delivery_pct"};
+    a '-' in the file is None. TURNOVER_LACS is lakhs of rupees: / 100 = crore."""
+    rows = _csv_rows(text)
+    hdr = [h.upper() for h in rows[0]] if rows else []
+    need = ("SYMBOL", "SERIES", "DATE1", "CLOSE_PRICE", "TTL_TRD_QNTY", "TURNOVER_LACS", "DELIV_PER")
+    if not set(need) <= set(hdr):
+        raise ScanError("not NSE's full bhavcopy (it starts %r)" % text.strip()[:60])
+    ix = {k: hdr.index(k) for k in need}
+    day, out = None, {}
+    for r in rows[1:]:
+        if len(r) < len(hdr) or r[ix["SERIES"]].upper() not in KEEP_SERIES:
+            continue
+        close = _num(r[ix["CLOSE_PRICE"]])
+        if close is None or close <= 0:
+            continue
+        day = day or nse_date(r[ix["DATE1"]])
+        vol, lacs = _num(r[ix["TTL_TRD_QNTY"]]), _num(r[ix["TURNOVER_LACS"]])
+        out[r[ix["SYMBOL"]].upper()] = {"close": close, "volume": None if vol is None else int(vol),
+                                        "turnover_cr": None if lacs is None else round(lacs / 100.0, 2),
+                                        "delivery_pct": _num(r[ix["DELIV_PER"]])}
+    if day is None or not out:
+        raise ScanError("NSE's bhavcopy has no series EQ rows")
+    return day, out
+
+
+def parse_ban(text):
+    """fo_secban.csv -> (trade date text like '25-NOV-2026', set of symbols). The file is
+    'Securities in Ban For Trade Date 25-NOV-2026:' and then one '1,SYMBOL' a line."""
+    lines = [ln.strip() for ln in text.lstrip("﻿").splitlines() if ln.strip()]
+    m = re.match(r"^securities in ban for trade date\s+(\S+?):?\s*$", lines[0], re.I) if lines else None
+    if not m:
+        raise ScanError("not NSE's F&O ban list (it starts %r)" % text.strip()[:60])
+    banned = set()
+    for ln in lines[1:]:
+        p = [c.strip().upper() for c in ln.split(",")]
+        if len(p) >= 2 and p[0].isdigit() and SYMBOL.match(p[1]):
+            banned.add(p[1])
+    return m.group(1).upper(), banned
+
+
+def parse_hilo(text):
+    """CM_52_wk_High_low_DDMMYYYY.csv -> {SYM: adjusted 52-week high}, series EQ. The file
+    opens with a disclaimer and an 'Effective for' line before the header."""
+    rows = _csv_rows(text)
+    at = [k for k, r in enumerate(rows) if r and r[0].upper() == "SYMBOL"]
+    hdr = [h.upper() for h in rows[at[0]]] if at else []
+    if not {"SYMBOL", "SERIES", "ADJUSTED_52_WEEK_HIGH"} <= set(hdr):
+        raise ScanError("not NSE's 52-week high/low file (it starts %r)" % text.strip()[:60])
+    i_s, i_h = hdr.index("SERIES"), hdr.index("ADJUSTED_52_WEEK_HIGH")
+    out = {}
+    for r in rows[at[0] + 1:]:
+        if len(r) > max(i_s, i_h) and r[i_s].upper() in KEEP_SERIES:
+            hi = _num(r[i_h])
+            if hi:
+                out[r[0].upper()] = hi
+    return out
+
+
+def build_index_universe(text):
+    """An NSE index constituents file (ind_nifty500list.csv) ->
+    (kept [(SYM, name)], {SYM: industry}, counts). Series EQ with a real ISIN only."""
+    rows = _csv_rows(text)
+    hdr = [h.upper() for h in rows[0]] if rows else []
+    if not {"COMPANY NAME", "INDUSTRY", "SYMBOL", "SERIES"} <= set(hdr):
+        raise ScanError("not an NSE index constituents list (it starts %r)" % text.strip()[:60])
+    kept, industry, counts = {}, {}, {"rows": 0}
+    for r in rows[1:]:
+        row = dict(zip(hdr, r))
+        counts["rows"] += 1
+        why = classify(row)
+        if why == "keep" and row.get("ISIN CODE") and not row["ISIN CODE"].upper().startswith("IN"):
+            why = "placeholder without a real ISIN"
+        counts[why] = counts.get(why, 0) + 1
+        if why == "keep":
+            sym = row["SYMBOL"].upper()
+            kept[sym] = " ".join(row["COMPANY NAME"].split())
+            if row["INDUSTRY"]:
+                industry[sym] = " ".join(row["INDUSTRY"].split())
+    return sorted(kept.items()), industry, counts
+
+
+def nse_file(subdir, name, parse, nse_dir=None, cache_dir=None, offline=False, net=None, pause=NSE_PAUSE,
+             save=True):
+    """One of NSE's published files -> (parse(text), where) or (None, why). Order: the
+    --nse folder if one was given (nothing else then), the copy saved in trader/state/
+    (cache_dir), one plain GET on NSE's archive host (no retry). `parse` raises ScanError
+    for a file that is not what it should be. `net` counts the requests of this run, so
+    that two of them are at least NSE_PAUSE apart. A downloaded file that parses is saved
+    in cache_dir (when `save`)."""
+    def read(path):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                return parse(fh.read()), ""
+        except (OSError, ScanError) as e:
+            return None, str(e)
+    if nse_dir:
+        p = os.path.join(nse_dir, name)
+        if not os.path.exists(p):
+            return None, "no %s in the --nse folder" % name
+        got, why = read(p)
+        return (got, "the --nse folder") if got is not None else (None, why)
+    if offline:
+        return None, "an offline run without --nse"
+    cached = os.path.join(cache_dir, name) if cache_dir else None
+    if cached and os.path.exists(cached):
+        got, _ = read(cached)
+        if got is not None:
+            return got, "the copy saved in %s" % cache_dir.replace("\\", "/")
+    net = net if net is not None else {}
+    if net.get("n"):
+        SLEEP(max(pause or 0, NSE_PAUSE))
+    net["n"] = net.get("n", 0) + 1
+    try:
+        text = http_get(NSE_BASE + subdir + name, timeout=60)
+        got = parse(text)
+    except urllib.error.HTTPError as e:
+        code = e.code
+        e.close()
+        return None, "HTTP %d" % code
+    except (urllib.error.URLError, OSError) as e:
+        return None, str(getattr(e, "reason", e))
+    except ScanError as e:
+        return None, str(e)
+    if cached and save:
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(cached, "w", encoding="utf-8", newline="") as fh:
+                fh.write(text)
+        except OSError:
+            pass
+    return got, "downloaded from NSE"
+
+
+def bhavcopy_for(day):
+    """A parser for nse_file: the bhavcopy must be the one of `day`."""
+    def parse(text):
+        got = parse_bhavcopy(text)
+        if got[0] != day:
+            raise ScanError("that bhavcopy is for %s, not %s" % (got[0].isoformat(), day.isoformat()))
+        return got
+    return parse
+
+
+def prune_cache(cache_dir, pattern, keep):
+    """Drop the older dated copies of one of this tool's own cached NSE files."""
+    rx = re.compile("^" + re.escape(pattern).replace("%s", r"\d{8}") + "$")
+    try:
+        for f in os.listdir(cache_dir):
+            if rx.match(f) and f != keep:
+                os.remove(os.path.join(cache_dir, f))
+    except OSError:
+        pass
+
+
+def read_industry(state_dir):
+    """trader/state/industry.json -> {SYM: industry} ({} when it is not there)."""
+    try:
+        with open(os.path.join(state_dir, INDUSTRY_FILE), encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    m = doc.get("industry") if isinstance(doc, dict) else None
+    return {str(k).upper(): str(v) for k, v in m.items()} if isinstance(m, dict) else {}
+
+
+def enrich_hits(hits, bhav=None, banned=None, hilo=None, industry=None):
+    """Add the optional fields to daily hits, in place. bhav = (session date, rows): a hit
+    gets delivery_pct and turnover_cr only when its close is that session's. banned = a set
+    of symbols -> fno_ban true. hilo = {SYM: the 52-week high before that session} ->
+    near_52w_high true and high_52w when the close is within NEAR_HIGH_PCT of it, or above
+    it. industry = {SYM: industry} -> industry. Nothing is added that the files do not say."""
+    day, rows = bhav if bhav else (None, {})
+    for h in hits:
+        sym = h["symbol"]
+        current = day is not None and h.get("close_date") == day.isoformat()
+        r = rows.get(sym) if current else None
+        if r:
+            if r["delivery_pct"] is not None:
+                h["delivery_pct"] = r["delivery_pct"]
+            if r["turnover_cr"] is not None:
+                h["turnover_cr"] = r["turnover_cr"]
+        if banned and sym in banned:
+            h["fno_ban"] = True
+        hi = (hilo or {}).get(sym) if current else None
+        if hi and h["price"] >= hi * (1 - NEAR_HIGH_PCT / 100.0):
+            h["near_52w_high"] = True
+            h["high_52w"] = hi
+        if industry and industry.get(sym):
+            h["industry"] = industry[sym]
+    return hits
+
+
 # ---------------------------------------------------------------- daily setups
 
 def rsi(closes, n=14):
@@ -468,14 +732,23 @@ def rsi(closes, n=14):
     return 100 - 100 / (1 + ag / al) if al else 100.0
 
 
-def daily_closes(series, now_utc):
-    """[(date, close)] of COMPLETE daily bars: null closes dropped, today's bar dropped
-    until the session closes, anything dated after the clock dropped.
+def daily_closes(series, now_utc, official=None):
+    """[(date, close)] of COMPLETE daily bars. See daily_bars."""
+    return daily_bars(series, now_utc, official)[0]
+
+
+def daily_bars(series, now_utc, official=None):
+    """-> ([(date, close)] of COMPLETE daily bars, where the latest one came from:
+    "yahoo", "bhavcopy" or "last_price"; None without bars). Null closes are dropped,
+    today's bar is dropped until the session closes, anything dated after the clock too.
 
     Yahoo often leaves the daily close of the latest NSE session null for hours after
-    the 15:30 close. When that bar is null, the session is over and the same answer's
-    meta carries a last price stamped in the session's final five minutes
-    (regularMarketTime), that price stands in for the close."""
+    the 15:30 close. `official` = (session date, close) from NSE's bhavcopy fills that
+    day when Yahoo's bar for it is null, or missing right after the session before it.
+    A close Yahoo did fill is never overwritten. Without `official`, when that bar is
+    null, the session is over and the same answer's meta carries a last price stamped in
+    the session's final five minutes (regularMarketTime), that price stands in for the
+    close: a last traded price, not NSE's official close."""
     now = to_ist(now_utc)
     today = now.date()
     s = session(today)
@@ -489,6 +762,13 @@ def daily_closes(series, now_utc):
             nulls.add(d)
             continue
         out[d] = float(c)  # one bar a day: a late duplicate (the live tick) wins
+    src = {}
+    if official and official[1] is not None:
+        d = official[0]
+        over = d < today or (d == today and today_done)
+        if over and d not in out and (d in nulls or (out and max(out) == prev_trading_day(d))):
+            out[d] = float(official[1])
+            src[d] = "bhavcopy"
     meta = series.get("meta") or {}
     mt, px = meta.get("regularMarketTime"), meta.get("regularMarketPrice")
     if nulls and mt and px is not None:
@@ -496,7 +776,9 @@ def daily_closes(series, now_utc):
         last_five = (datetime.datetime.combine(at.date(), CLOSE) - datetime.timedelta(minutes=BAR_MIN)).time()
         if at.date() in nulls and at.date() not in out and at.date() == max(nulls) and at.time() >= last_five:
             out[at.date()] = float(px)
-    return sorted(out.items())
+            src[at.date()] = "last_price"
+    bars = sorted(out.items())
+    return bars, (src.get(bars[-1][0], "yahoo") if bars else None)
 
 
 def find_setups(closes):
@@ -525,21 +807,29 @@ def find_setups(closes):
                   "run_pct": run * 100, "range5_pct": rng5 * 100}
 
 
-def scan_daily(data, symbols, now_utc, min_price, min_volume):
-    """Pure. data = {SYM: series}. Returns (hits, counts, last_date)."""
+def scan_daily(data, symbols, now_utc, min_price, min_volume, bhav=None, tally=None):
+    """Pure. data = {SYM: series}. Returns (hits, counts, last_date).
+    bhav = (session date, {SYM: row}) from parse_bhavcopy: its CLOSE_PRICE is that day's
+    close where Yahoo has none, and then its TTL_TRD_QNTY is the volume. tally, a dict, is
+    filled with how many scanned charts took their latest close from where
+    ("yahoo", "bhavcopy", "last_price")."""
     hits, dates = [], {}
+    b_day, b_rows = bhav if bhav else (None, {})
     counts = {"requested": len(symbols), "fetched": 0, "illiquid": 0, "short": 0, "scanned": 0}
     for sym in symbols:
         s = data.get(sym)
         if not s:
             continue
         counts["fetched"] += 1
-        bars = daily_closes(s, now_utc)
+        row = b_rows.get(sym)
+        bars, src = daily_bars(s, now_utc, (b_day, row["close"]) if row else None)
         meta = s.get("meta") or {}
         price = meta.get("regularMarketPrice")
-        if price is None and bars:
+        if bars and (price is None or src == "bhavcopy"):
             price = bars[-1][1]
         vol = meta.get("regularMarketVolume")
+        if src == "bhavcopy" and row["volume"] is not None:
+            vol = row["volume"]
         if price is None or price < min_price or (min_volume > 0 and (vol is None or vol < min_volume)):
             counts["illiquid"] += 1
             continue
@@ -547,6 +837,8 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume):
             counts["short"] += 1
             continue
         counts["scanned"] += 1
+        if tally is not None:
+            tally[src] = tally.get(src, 0) + 1
         d_last = bars[-1][0]
         dates[d_last] = dates.get(d_last, 0) + 1
         closes = [c for _, c in bars]
@@ -838,7 +1130,67 @@ def money(x):
 
 # ---------------------------------------------------------------- commands
 
+def state_dir(a):
+    """--state, else the state/ folder beside the output file (trader/state)."""
+    return a.state or os.path.join(os.path.dirname(a.out) or ".", "state")
+
+
+def cmd_index_universe(a):
+    """universe --index nifty500: the index's constituents instead of every EQ stock."""
+    t0 = time.time()
+    subdir, fname, label = INDEX_LISTS[a.index]
+    if a.offline:
+        p = os.path.join(a.offline, fname) if os.path.isdir(a.offline) else a.offline
+        if not os.path.exists(p):
+            raise ScanError("no %s at %s" % (fname, a.offline))
+        with open(p, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    else:
+        try:
+            text = http_get(NSE_BASE + subdir + fname, timeout=60)
+        except urllib.error.HTTPError as e:
+            code = e.code
+            e.close()
+            raise ScanError("could not get %s from NSE (HTTP %d). Save the file yourself and pass "
+                            "--offline FILE." % (fname, code))
+        except (urllib.error.URLError, OSError) as e:
+            raise ScanError("could not get %s from NSE (%s). Save the file yourself and pass "
+                            "--offline FILE." % (fname, getattr(e, "reason", e)))
+    kept, industry, counts = build_index_universe(text)
+    ind_path = os.path.join(state_dir(a), INDUSTRY_FILE)
+    if not a.no_write and kept:
+        d = os.path.dirname(a.out)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(a.out, "w", encoding="utf-8") as fh:
+            for sym, name in kept:
+                fh.write("%s|%s\n" % (sym, name))
+        write_json(ind_path, {"created_by": "trader-scanner", "source": fname, "index": label,
+                              "created_at": parse_now(None).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                              "industry": industry})
+    dropped = {k: v for k, v in counts.items() if k not in ("keep", "rows")}
+    n_ind = len(set(industry.values()))
+    shown = ind_path.replace("\\", "/")
+    if a.json:
+        print(json.dumps({"index": a.index, "count": len(kept), "rows": counts.get("rows", 0), "dropped": dropped,
+                          "industries": n_ind, "out": None if a.no_write else a.out,
+                          "industry_out": None if a.no_write else shown,
+                          "seconds": round(time.time() - t0, 1)}, indent=2))
+    else:
+        print("NSE's %s list (%s): %s rows." % (label, fname, "{:,}".format(counts.get("rows", 0))))
+        print("Kept %s stocks in series EQ (the series that can be traded intraday), in %d industries."
+              % ("{:,}".format(len(kept)), n_ind))
+        if dropped:
+            print("Dropped: " + ", ".join("%s %s" % ("{:,}".format(v), k)
+                                          for k, v in sorted(dropped.items(), key=lambda kv: (-kv[1], kv[0]))) + ".")
+        if not a.no_write and kept:
+            print("Wrote %s (one SYMBOL|Name a line) and %s (SYMBOL -> industry)." % (a.out, shown))
+    return 0 if kept else 1
+
+
 def cmd_universe(a):
+    if a.index:
+        return cmd_index_universe(a)
     t0 = time.time()
     if a.offline:
         p = os.path.join(a.offline, NSE_LIST) if os.path.isdir(a.offline) else a.offline
@@ -884,13 +1236,42 @@ def cmd_daily(a):
         progress(a, "Fetching daily closes for %s symbols (%d spark requests)..."
                  % ("{:,}".format(len(symbols)), (len(symbols) + SPARK_MAX - 1) // SPARK_MAX))
         data, failed = fetch_spark(symbols, "3mo", "1d", a.pause, a)
-    hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume)
+    # NSE's own files for the latest completed session: official closes, delivery, the ban list
+    state = state_dir(a)
+    sday = latest_session(now)
+    stamp = sday.strftime("%d%m%Y")
+    kw = {"nse_dir": a.nse, "cache_dir": state, "offline": bool(a.offline), "net": {}, "pause": a.pause,
+          "save": not a.no_write}
+    bhav, bhav_how = None, "--no-nse"
+    if not a.no_nse:
+        bhav, bhav_how = nse_file(BHAV_DIR, BHAV_NAME % stamp, bhavcopy_for(sday), **kw)
+        if bhav_how == "downloaded from NSE" and not a.no_write:
+            prune_cache(state, BHAV_NAME, BHAV_NAME % stamp)
+    tally = {}
+    hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume, bhav, tally)
+    ban, ban_how, hilo, hilo_how = None, "", None, ""
+    nse_on = not a.no_nse and not (a.offline and not a.nse)   # offline without --nse: nothing to read
+    if hits and nse_on:
+        ban, ban_how = nse_file(BAN_DIR, BAN_NAME, parse_ban, **dict(kw, cache_dir=None))   # never cached
+        hilo_how = "it goes with the bhavcopy"
+        if bhav:   # the tag compares that session's close, so it needs the same day's bhavcopy
+            hilo, hilo_how = nse_file(HILO_DIR, HILO_NAME % stamp, parse_hilo, **kw)
+            if hilo_how == "downloaded from NSE" and not a.no_write:
+                prune_cache(state, HILO_NAME, HILO_NAME % stamp)
+    industry = read_industry(state)
+    enrich_hits(hits, bhav, ban[1] if ban else None, hilo, industry)
     nfailed = len(symbols) - counts["fetched"]
     as_of = ("%s close" % last_date.isoformat()) if last_date else None
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "daily",
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
            "source": "yahoo", "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
            "note": NOTE, "hits": hits}
+    if not a.no_nse:
+        doc["nse"] = {"session": sday.isoformat(), "bhavcopy": (BHAV_NAME % stamp) if bhav else None,
+                      "bhavcopy_from": bhav_how, "latest_close_from": tally,
+                      "fno_ban_trade_date": ban[0] if ban else None,
+                      "fno_ban": sorted(ban[1]) if ban else None,
+                      "high_52w_file": (HILO_NAME % stamp) if hilo is not None else None}
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
     if not a.no_write:
@@ -908,16 +1289,58 @@ def cmd_daily(a):
                            "{:,}".format(a.min_volume),
                            (", %d had under %d days" % (counts["short"], MIN_DAILY_BARS)) if counts["short"] else "",
                            "{:,}".format(counts["scanned"])))
+    n_off, n_last = tally.get("bhavcopy", 0), tally.get("last_price", 0)
+    last_note = ("%s chart%s take%s the session's last traded price from Yahoo as that day's close, not the "
+                 "official close" % ("{:,}".format(n_last), "" if n_last == 1 else "s", "s" if n_last == 1 else ""))
+    if bhav:
+        print("Official closes: NSE's bhavcopy of %s (%s, %s) gave the close and the volume of that day for "
+              "%s chart%s that Yahoo had left empty%s."
+              % (sday.isoformat(), BHAV_NAME % stamp, bhav_how, "{:,}".format(n_off), "" if n_off == 1 else "s",
+                 ("; " + last_note + " (not in the bhavcopy's EQ rows)") if n_last else ""))
+    elif not a.no_nse:
+        hint = (": NSE publishes it in the evening after the session, so it may not be out yet"
+                if bhav_how == "HTTP 404" else "")
+        print("NSE's bhavcopy of %s was not used (%s%s). %s."
+              % (sday.isoformat(), bhav_how, hint,
+                 (last_note[0].upper() + last_note[1:]) if n_last else
+                 "Closes are Yahoo's own daily bars, and there are no delivery or turnover figures"))
+    elif n_last:
+        print("%s (--no-nse)." % (last_note[0].upper() + last_note[1:]))
     if hits:
         per = [(k, sum(1 for h in hits if k in h["setups"])) for k, _ in SETUPS]
         print("%d chart%s matched a setup: %s." % (len(hits), "" if len(hits) == 1 else "s",
                                                   ", ".join("%d %s" % (n, LABEL[k]) for k, n in per if n)))
+        if ban:
+            inban = [h["symbol"] for h in hits if h.get("fno_ban")]
+            print("F&O ban list for trade date %s (%s): %d stock%s; %s. Information only for a cash-segment trade."
+                  % (ban[0], BAN_NAME, len(ban[1]), "" if len(ban[1]) == 1 else "s",
+                     ("among the hits: " + ", ".join(inban)) if inban else "none of the hits is on it"))
+        elif nse_on:
+            print("NSE's F&O ban list was not read (%s): no ban flags." % ban_how)
+        if hilo is not None:
+            n_hi = sum(1 for h in hits if h.get("near_52w_high"))
+            print("%d hit%s closed within %s %% of the 52-week high, or above it (%s: adjusted highs up to the "
+                  "session before)." % (n_hi, "" if n_hi == 1 else "s", _n(NEAR_HIGH_PCT), HILO_NAME % stamp))
+        elif nse_on and bhav:
+            print("NSE's 52-week high/low file was not read (%s): no near-high tags." % hilo_how)
         print("Most traded first (price x volume):")
     else:
         print("No setups.")
     for h in hits[:a.show]:
-        print("  %-12s %11s  RSI %5.1f  %s" % (h["symbol"], money(h["price"]), h["rsi"],
-                                              ", ".join(LABEL[t] for t in h["setups"])))
+        more = []
+        if h.get("delivery_pct") is not None:
+            more.append("delivery %.1f %%" % h["delivery_pct"])
+        if h.get("turnover_cr") is not None:
+            more.append("₹%s cr traded" % "{:,.2f}".format(h["turnover_cr"]))
+        if h.get("industry"):
+            more.append(h["industry"])
+        if h.get("near_52w_high"):
+            more.append("near its 52-week high (%s)" % _p(h["high_52w"]))
+        if h.get("fno_ban"):
+            more.append("in the F&O ban period")
+        print("  %-12s %11s  RSI %5.1f  %s%s" % (h["symbol"], money(h["price"]), h["rsi"],
+                                                ", ".join(LABEL[t] for t in h["setups"]),
+                                                ("  [" + "; ".join(more) + "]") if more else ""))
     if len(hits) > a.show:
         print("  ... and %d more in the watchlist (--show N for more)." % (len(hits) - a.show))
     if not a.no_write:
@@ -1036,7 +1459,10 @@ def main(argv=None):
 
     p = sub.add_parser("universe", help="download NSE's equity list -> trader/universe.txt")
     p.add_argument("--out", default=DEFAULT_UNIVERSE)
-    p.add_argument("--offline", metavar="PATH", help="a saved EQUITY_L.csv, or the folder holding it")
+    p.add_argument("--index", choices=sorted(INDEX_LISTS),
+                   help="an NSE index's constituents instead of every EQ stock (also writes the industry map)")
+    p.add_argument("--state", metavar="DIR", help="where industry.json goes (default: state/ beside --out)")
+    p.add_argument("--offline", metavar="PATH", help="a saved EQUITY_L.csv (or the index list), or the folder holding it")
     p.add_argument("--no-write", action="store_true")
     p.add_argument("--pause", type=float, default=PAUSE)
     p.add_argument("--json", action="store_true")
@@ -1060,6 +1486,11 @@ def main(argv=None):
 
     p = sub.add_parser("daily", help="pre-market setups from daily closes")
     common(p, 50.0, 500000)
+    p.add_argument("--nse", metavar="DIR", help="a folder of saved NSE files (bhavcopy, fo_secban.csv, "
+                                                "52-week file) instead of downloading them")
+    p.add_argument("--no-nse", action="store_true", help="do not read NSE's daily files at all")
+    p.add_argument("--state", metavar="DIR", help="where NSE's files are kept between runs and industry.json "
+                                                  "is read (default: state/ beside --out)")
     p = sub.add_parser("orb", help="opening-range breakouts so far today")
     common(p, 50.0, 0)
     p.add_argument("--or-minutes", type=int, default=15)

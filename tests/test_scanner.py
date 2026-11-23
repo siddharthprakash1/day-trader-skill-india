@@ -20,6 +20,13 @@ DAILY = os.path.join(SDIR, "daily-spark-3mo")              # two real 20-symbol 
 LIVE = os.path.join(DAILY, "part1.json")                   # the first of them (19 real names + ZZZZQX)
 SPARK5 = os.path.join(SDIR, "spark-5m-5d-part1.json.gz")   # the same 20 symbols, spark 5d of 5m closes
 EQL = os.path.join(SDIR, "equity_l")                       # NSE's EQUITY_L.csv of that day, cut to 22 real rows
+# NSE's own daily files, downloaded 2026-11-24 from nsearchives.nseindia.com and cut to the fixture symbols:
+#   sec_bhavdata_full_23112026.csv   Monday's full bhavcopy: the 39 chart symbols + MANAPPURAM (EQ), one BE row
+#   CM_52_wk_High_low_23112026.csv   the same symbols, with the file's two heading lines and a '-' row
+#   fo_secban.csv                    whole (one stock)
+#   ind_nifty500list.csv             the same symbols + every non-EQ row and the placeholder row of the real list
+NSE = os.path.join(SDIR, "nse")
+BHAV = os.path.join(NSE, "sec_bhavdata_full_23112026.csv")
 PART1 = ("RELIANCE HDFCBANK ICICIBANK SBIN INFY TCS ITC LT AXISBANK KOTAKBANK BHARTIARTL HINDUNILVR BAJFINANCE M&M "
          "MARUTI SUNPHARMA TATASTEEL NTPC POWERGRID ZZZZQX").split()
 DT = datetime.datetime
@@ -806,6 +813,387 @@ class Cli(unittest.TestCase):
         self.assertEqual((out["as_of"], out["scanned"], len(out["hits"])), ("2026-11-23 close", 36, 10))
         code, text, _ = run(["orb", "--offline", WALL, "--now", "2026-11-23 10:00", "--json", "--no-write"])
         self.assertEqual(json.loads(text)["filters"], {"min_price": 50.0, "min_volume": 0})
+
+
+def nse_text(name):
+    with open(os.path.join(NSE, name), encoding="utf-8") as fh:
+        return fh.read()
+
+
+class NseFiles(unittest.TestCase):
+    """NSE's own published files: the bhavcopy, the ban list, the 52-week file, the Nifty 500 list."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.day, cls.rows = scan.parse_bhavcopy(nse_text("sec_bhavdata_full_23112026.csv"))
+        cls.hilo = scan.parse_hilo(nse_text("CM_52_wk_High_low_23112026.csv"))
+        cls.data, _ = scan.load_offline(DAILY)
+        cls.syms = sorted(cls.data)
+
+    def test_latest_completed_session(self):
+        for now, want in (("2026-11-23 15:29", D(2026, 11, 20)),      # Monday, still open: Friday
+                          ("2026-11-23 15:30", MON),
+                          ("2026-11-24 01:00", MON),                  # the holiday
+                          ("2026-11-25 09:00", MON),                  # Wednesday before the close: the holiday is skipped
+                          ("2026-11-25 16:00", D(2026, 11, 25)),
+                          ("2026-11-22 12:00", D(2026, 11, 20))):     # Sunday
+            self.assertEqual(scan.latest_session(scan.parse_now(now)), want, now)
+        self.assertEqual(scan.prev_trading_day(MON), D(2026, 11, 20))
+        self.assertEqual(scan.prev_trading_day(D(2026, 11, 25)), MON)
+
+    def test_the_bhavcopy(self):
+        text = nse_text("sec_bhavdata_full_23112026.csv")
+        self.assertTrue(text.startswith("SYMBOL, SERIES, DATE1, PREV_CLOSE, OPEN_PRICE,"))   # NSE's own header
+        self.assertEqual(self.day, MON)
+        self.assertEqual(len(self.rows), 40)                 # 41 rows in the cut, the series BE one is out
+        self.assertNotIn("21STCENMGM", self.rows)
+        # RELIANCE, EQ, 23-Nov-2026, ..., CLOSE 1351.00, ..., 15392522, 209437.69 (lakhs), ..., 53.91
+        self.assertEqual(self.rows["RELIANCE"], {"close": 1351.0, "volume": 15392522, "turnover_cr": 2094.38,
+                                                 "delivery_pct": 53.91})
+        self.assertEqual(self.rows["M&M"]["close"], 3487.4)
+        self.assertEqual(set(self.syms) - set(self.rows), set())
+        for bad in ("<html>Not Found</html>", "", "SYMBOL,NAME OF COMPANY, SERIES\nX,Y,EQ\n"):
+            with self.assertRaises(scan.ScanError):
+                scan.parse_bhavcopy(bad)
+        with self.assertRaises(scan.ScanError) as cm:
+            scan.bhavcopy_for(D(2026, 11, 20))(text)         # Monday's file is not Friday's
+        self.assertIn("is for 2026-11-23, not 2026-11-20", str(cm.exception))
+        self.assertEqual(scan.nse_date("23-Nov-2026"), MON)
+        self.assertEqual(scan.nse_date("25-NOV-2026"), D(2026, 11, 25))
+        self.assertIsNone(scan.nse_date("-"))
+        self.assertIsNone(scan._num(" - "))
+        self.assertEqual(scan._num("   8230.00"), 8230.0)
+
+    def test_the_official_close_fills_the_empty_bar(self):
+        t = self.data["RELIANCE"]
+        after = scan.parse_now("2026-11-24 09:00")
+        self.assertEqual(scan.daily_bars(t, after), (scan.daily_closes(t, after), "last_price"))
+        bars, src = scan.daily_bars(t, after, (MON, 1350.25))          # a made-up close, to tell the two apart
+        self.assertEqual((bars[-1], src), ((MON, 1350.25), "bhavcopy"))
+        self.assertEqual(scan.daily_closes(t, after, (MON, 1350.25))[-1], (MON, 1350.25))
+        # not before the session is over
+        bars, src = scan.daily_bars(t, scan.parse_now("2026-11-23 15:29"), (MON, 1350.25))
+        self.assertEqual((bars[-1], src), ((D(2026, 11, 20), 1377.5), "yahoo"))
+        # a close Yahoo did fill is never overwritten
+        s = {"t": [ts("2026-11-20 09:15"), ts("2026-11-23 09:15")], "c": [10.0, 11.0], "meta": {}}
+        self.assertEqual(scan.daily_bars(s, after, (MON, 12.0)), ([(D(2026, 11, 20), 10.0), (MON, 11.0)], "yahoo"))
+        # a bar that is missing altogether is added only right after the session before it
+        s = {"t": [ts("2026-11-19 09:15"), ts("2026-11-20 09:15")], "c": [9.0, 10.0], "meta": {}}
+        self.assertEqual(scan.daily_bars(s, after, (MON, 12.0))[0][-1], (MON, 12.0))
+        s = {"t": [ts("2026-11-18 09:15"), ts("2026-11-19 09:15")], "c": [9.0, 10.0], "meta": {}}
+        self.assertEqual(scan.daily_bars(s, after, (MON, 12.0)), ([(D(2026, 11, 18), 9.0), (D(2026, 11, 19), 10.0)],
+                                                                  "yahoo"))
+        self.assertEqual(scan.daily_bars({"t": [], "c": [], "meta": {}}, after, (MON, 12.0)), ([], None))
+
+    def test_the_scan_with_the_bhavcopy(self):
+        now = scan.parse_now("2026-11-24 09:00")
+        tally, plain = {}, {}
+        hits, counts, last = scan.scan_daily(self.data, self.syms, now, 50, 500000, (self.day, self.rows), tally)
+        old = scan.scan_daily(self.data, self.syms, now, 50, 500000, None, plain)
+        self.assertEqual((tally, plain), ({"bhavcopy": 36}, {"last_price": 36}))
+        self.assertEqual(last, MON)
+        # on this day Yahoo's last price was already the official close for all 39, so the same charts match
+        self.assertEqual([s for s in self.syms if self.data[s]["meta"]["regularMarketPrice"] != self.rows[s]["close"]],
+                         [])
+        self.assertEqual([(h["symbol"], h["setups"], h["price"]) for h in hits],
+                         [(h["symbol"], h["setups"], h["price"]) for h in old[0]])
+        self.assertEqual(counts, old[1])
+        # the volume is the bhavcopy's TTL_TRD_QNTY, not Yahoo's regularMarketVolume (15,388,955)
+        rel = [h for h in hits if h["symbol"] == "RELIANCE"][0]
+        self.assertEqual((rel["volume"], [h for h in old[0] if h["symbol"] == "RELIANCE"][0]["volume"]),
+                         (15392522, 15388955))
+        # Monday before the open: Monday's file has nothing to say about Friday's closes
+        tally = {}
+        hits, _, last = scan.scan_daily(self.data, self.syms, scan.parse_now("2026-11-23 09:00"), 50, 500000,
+                                        (self.day, self.rows), tally)
+        self.assertEqual((last, tally), (D(2026, 11, 20), {"yahoo": 36}))
+        # a symbol that is not in the bhavcopy's EQ rows keeps the last-price fill
+        few = {k: v for k, v in self.rows.items() if k != "TCS"}
+        tally = {}
+        scan.scan_daily(self.data, self.syms, now, 50, 500000, (self.day, few), tally)
+        self.assertEqual(tally, {"bhavcopy": 35, "last_price": 1})
+
+    def test_the_ban_list_and_the_52_week_file(self):
+        self.assertEqual(scan.parse_ban(nse_text("fo_secban.csv")), ("25-NOV-2026", {"MANAPPURAM"}))
+        self.assertEqual(scan.parse_ban("Securities in Ban For Trade Date 25-NOV-2026:\n"), ("25-NOV-2026", set()))
+        with self.assertRaises(scan.ScanError):
+            scan.parse_ban("<html>Access Denied</html>")
+        self.assertTrue(nse_text("CM_52_wk_High_low_23112026.csv").startswith('"Disclaimer - '))
+        self.assertEqual(len(self.hilo), 40)                 # the BE row and the '-' row (1STCUS$) are out
+        self.assertEqual((self.hilo["EICHERMOT"], self.hilo["M&M"]), (8230.0, 3839.9))
+        with self.assertRaises(scan.ScanError):
+            scan.parse_hilo("<html>Not Found</html>")
+
+    def test_the_optional_fields_on_a_hit(self):
+        now = scan.parse_now("2026-11-24 09:00")
+        hits, _, _ = scan.scan_daily(self.data, self.syms, now, 50, 500000, (self.day, self.rows))
+        industry = scan.build_index_universe(nse_text("ind_nifty500list.csv"))[1]
+        scan.enrich_hits(hits, (self.day, self.rows), {"MANAPPURAM", "SBIN"}, self.hilo, industry)   # SBIN: made up
+        by = {h["symbol"]: h for h in hits}
+        self.assertEqual(by["RELIANCE"], {"symbol": "RELIANCE", "setups": ["bull_flag"], "price": 1351.0,
+                                          "close_date": "2026-11-23", "rsi": 64.8, "volume": 15392522,
+                                          "delivery_pct": 53.91, "turnover_cr": 2094.38,
+                                          "industry": "Oil Gas & Consumable Fuels"})
+        # EICHERMOT closed at 8172.50; its 52-week high before Monday was 8230.00 (0.7 % above)
+        self.assertEqual((by["EICHERMOT"]["near_52w_high"], by["EICHERMOT"]["high_52w"]), (True, 8230.0))
+        self.assertEqual([s for s, h in by.items() if h.get("near_52w_high")], ["EICHERMOT"])
+        self.assertEqual([s for s, h in by.items() if h.get("fno_ban")], ["SBIN"])
+        self.assertNotIn("fno_ban", by["RELIANCE"])
+        # a hit whose close is another day's gets no figures of this session
+        stale = [{"symbol": "RELIANCE", "setups": ["bull_flag"], "price": 1377.5, "close_date": "2026-11-20",
+                  "rsi": 75.0, "volume": 1}]
+        scan.enrich_hits(stale, (self.day, self.rows), set(), self.hilo, {})
+        self.assertEqual(sorted(stale[0]), ["close_date", "price", "rsi", "setups", "symbol", "volume"])
+        # and with nothing to add, nothing is added
+        bare = [dict(stale[0])]
+        self.assertEqual(scan.enrich_hits(bare), stale)
+
+    def test_the_nifty_500_list(self):
+        text = nse_text("ind_nifty500list.csv")
+        self.assertTrue(text.startswith("Company Name,Industry,Symbol,Series,ISIN Code"))
+        kept, industry, counts = scan.build_index_universe(text)
+        self.assertEqual(counts, {"rows": 46, "keep": 40, "series RR": 3, "series BE": 2,
+                                  "placeholder without a real ISIN": 1})     # REITs, trade-for-trade, DUMMYHEG
+        self.assertEqual(dict(kept)["M&M"], "Mahindra & Mahindra Ltd.")
+        self.assertEqual(industry["M&M"], "Automobile and Auto Components")
+        self.assertEqual(sorted(industry), [s for s, _ in kept])
+        self.assertNotIn("DUMMYHEG", industry)
+        self.assertNotIn("EMBASSY", industry)
+        with self.assertRaises(scan.ScanError):
+            scan.build_index_universe(nse_text("sec_bhavdata_full_23112026.csv"))
+
+
+class NseDownloads(unittest.TestCase):
+    """nse_file without the network: one plain GET, a saved copy, a 404."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.state = os.path.join(self.d, "trader", "state")
+        self.calls, self.sleeps, self.answers = [], [], {}
+        self._get, self._sleep = scan.http_get, scan.SLEEP
+        scan.SLEEP = self.sleeps.append
+
+        def fake(url, timeout=20):
+            self.calls.append(url)
+            name = url.rsplit("/", 1)[1]
+            if name not in self.answers:
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO(b"<html>"))
+            return self.answers[name]
+        scan.http_get = fake
+
+    def tearDown(self):
+        scan.http_get, scan.SLEEP = self._get, self._sleep
+        shutil.rmtree(self.d)
+
+    def test_download_once_then_the_saved_copy(self):
+        name = "sec_bhavdata_full_23112026.csv"
+        self.answers[name] = nse_text(name)
+        os.makedirs(self.state)
+        with open(os.path.join(self.state, "sec_bhavdata_full_20112026.csv"), "w") as fh:
+            fh.write("an older copy")
+        got, where = scan.nse_file(scan.BHAV_DIR, name, scan.bhavcopy_for(MON), cache_dir=self.state)
+        self.assertEqual((got[0], len(got[1]), where), (MON, 40, "downloaded from NSE"))
+        self.assertEqual(self.calls, ["https://nsearchives.nseindia.com/products/content/" + name])
+        with open(os.path.join(self.state, name), encoding="utf-8", newline="") as fh:
+            self.assertEqual(fh.read(), self.answers[name])                  # saved as it came
+        got2, where = scan.nse_file(scan.BHAV_DIR, name, scan.bhavcopy_for(MON), cache_dir=self.state)
+        self.assertEqual((got2, len(self.calls)), (got, 1))                  # no second request
+        self.assertTrue(where.startswith("the copy saved in "))
+        scan.prune_cache(self.state, scan.BHAV_NAME, name)
+        self.assertEqual(os.listdir(self.state), [name])
+        # save=False (a --no-write run) leaves nothing behind
+        other = os.path.join(self.d, "other")
+        scan.nse_file(scan.BHAV_DIR, name, scan.bhavcopy_for(MON), cache_dir=other, save=False)
+        self.assertFalse(os.path.exists(other))
+
+    def test_a_404_and_a_page_that_is_not_the_file(self):
+        name = "sec_bhavdata_full_25112026.csv"
+        net = {}
+        self.assertEqual(scan.nse_file(scan.BHAV_DIR, name, scan.bhavcopy_for(D(2026, 11, 25)), cache_dir=self.state,
+                                       net=net), (None, "HTTP 404"))
+        self.assertEqual(len(self.calls), 1)                                 # no retry, no other host
+        self.assertFalse(os.path.exists(self.state))
+        self.answers[name] = "<html>Access Denied</html>"
+        got, why = scan.nse_file(scan.BHAV_DIR, name, scan.bhavcopy_for(D(2026, 11, 25)), cache_dir=self.state,
+                                 net=net)
+        self.assertIsNone(got)
+        self.assertIn("not NSE's full bhavcopy", why)
+        self.assertFalse(os.path.exists(self.state))                         # a bad answer is never saved
+        self.assertEqual(self.sleeps, [scan.NSE_PAUSE])                      # half a second between two requests
+        self.assertEqual(scan.NSE_PAUSE, 0.5)
+        scan.http_get = lambda url, timeout=20: (_ for _ in ()).throw(urllib.error.URLError("down"))
+        self.assertEqual(scan.nse_file(scan.BAN_DIR, "fo_secban.csv", scan.parse_ban), (None, "down"))
+
+    def test_a_folder_of_saved_files_and_offline(self):
+        got, where = scan.nse_file(scan.BAN_DIR, "fo_secban.csv", scan.parse_ban, nse_dir=NSE)
+        self.assertEqual((got, where), (("25-NOV-2026", {"MANAPPURAM"}), "the --nse folder"))
+        got, why = scan.nse_file(scan.BHAV_DIR, "sec_bhavdata_full_20112026.csv", scan.bhavcopy_for(D(2026, 11, 20)),
+                                 nse_dir=NSE)
+        self.assertEqual((got, why), (None, "no sec_bhavdata_full_20112026.csv in the --nse folder"))
+        self.assertEqual(scan.nse_file(scan.BAN_DIR, "fo_secban.csv", scan.parse_ban, offline=True),
+                         (None, "an offline run without --nse"))
+        self.assertEqual(self.calls, [])
+
+    def daily_live(self, argv):
+        """`daily` on the networked path: a fake Yahoo answering from the two saved spark answers."""
+        docs = [json.loads(scan._read_maybe_gz(os.path.join(DAILY, f))) for f in ("part1.json", "part2.json")]
+        both = json.dumps({"spark": {"result": docs[0]["spark"]["result"] + docs[1]["spark"]["result"],
+                                     "error": None}})
+        syms = sorted(scan.parse_spark(both))
+        old = scan.yahoo_get
+        scan.yahoo_get = lambda path: both
+        try:
+            return run(["daily", "--symbols", ",".join(syms), "--out", os.path.join(self.d, "trader", "wl.json")]
+                       + argv)
+        finally:
+            scan.yahoo_get = old
+
+    def test_daily_downloads_each_file_once_and_keeps_them(self):
+        for name in ("sec_bhavdata_full_23112026.csv", "CM_52_wk_High_low_23112026.csv", "fo_secban.csv"):
+            self.answers[name] = nse_text(name)
+        code, text, _ = self.daily_live(["--now", "2026-11-23 18:00"])
+        self.assertEqual(code, 0)
+        base = "https://nsearchives.nseindia.com/"
+        self.assertEqual(self.calls, [base + "products/content/sec_bhavdata_full_23112026.csv",
+                                      base + "content/fo/fo_secban.csv",
+                                      base + "content/CM_52_wk_High_low_23112026.csv"])
+        self.assertEqual(self.sleeps, [0.3, 0.5, 0.5])     # one between the two Yahoo requests, then NSE's two
+        self.assertIn("Official closes: NSE's bhavcopy of 2026-11-23 (sec_bhavdata_full_23112026.csv, downloaded "
+                      "from NSE) gave the close and the volume of that day for 36 charts that Yahoo had left empty.",
+                      text)
+        self.assertEqual(sorted(os.listdir(self.state)), ["CM_52_wk_High_low_23112026.csv",
+                                                          "sec_bhavdata_full_23112026.csv"])   # the ban list is not kept
+        del self.calls[:]
+        code, text, _ = self.daily_live(["--now", "2026-11-23 18:00"])
+        self.assertEqual(self.calls, [base + "content/fo/fo_secban.csv"])    # the same evening: only the ban list
+        self.assertIn("the copy saved in ", text)
+        self.assertIn("for 36 charts that Yahoo had left empty", text)
+
+    def test_daily_falls_back_when_the_bhavcopy_is_not_out(self):
+        self.answers["fo_secban.csv"] = nse_text("fo_secban.csv")
+        code, text, _ = self.daily_live(["--now", "2026-11-23 15:45"])
+        self.assertEqual(code, 0)
+        self.assertIn("NSE's bhavcopy of 2026-11-23 was not used (HTTP 404: NSE publishes it in the evening after "
+                      "the session, so it may not be out yet). 36 charts take the session's last traded price from "
+                      "Yahoo as that day's close, not the official close.", text)
+        self.assertEqual([c.rsplit("/", 1)[1] for c in self.calls], ["sec_bhavdata_full_23112026.csv",
+                                                                     "fo_secban.csv"])   # no 52-week request either
+        self.assertNotIn("delivery", text)
+        with open(os.path.join(self.d, "trader", "wl.json"), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        self.assertEqual(doc["nse"], {"session": "2026-11-23", "bhavcopy": None, "bhavcopy_from": "HTTP 404",
+                                      "latest_close_from": {"last_price": 36}, "fno_ban_trade_date": "25-NOV-2026",
+                                      "fno_ban": ["MANAPPURAM"], "high_52w_file": None})
+        self.assertEqual(sorted(doc["hits"][0]), ["close_date", "price", "rsi", "setups", "symbol", "volume"])
+        # --no-nse asks NSE for nothing
+        del self.calls[:]
+        code, text, _ = self.daily_live(["--now", "2026-11-23 15:45", "--no-nse", "--no-write"])
+        self.assertEqual(self.calls, [])
+        self.assertIn("36 charts take the session's last traded price from Yahoo as that day's close, not the "
+                      "official close (--no-nse).", text)
+
+
+class NseCli(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.t = os.path.join(self.d, "trader")
+        self.wl = os.path.join(self.t, "watchlist.json")
+        self.uni = os.path.join(self.t, "universe.txt")
+
+    def tearDown(self):
+        shutil.rmtree(self.d)
+
+    def test_nifty_500_universe_then_daily_with_the_nse_files(self):
+        code, text, _ = run(["universe", "--index", "nifty500", "--offline", NSE, "--out", self.uni])
+        self.assertEqual(code, 0)
+        self.assertIn("NSE's Nifty 500 list (ind_nifty500list.csv): 46 rows.", text)
+        self.assertIn("Kept 40 stocks in series EQ (the series that can be traded intraday), in 15 industries.", text)
+        self.assertIn("Dropped: 3 series RR, 2 series BE, 1 placeholder without a real ISIN.", text)
+        with open(self.uni, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        self.assertEqual(len(lines), 40)
+        self.assertIn("M&M|Mahindra & Mahindra Ltd.", lines)
+        self.assertTrue(all(ln.count("|") == 1 for ln in lines))            # still SYMBOL|Name, two columns
+        with open(os.path.join(self.t, "state", "industry.json"), encoding="utf-8") as fh:
+            ind = json.load(fh)
+        self.assertEqual((ind["source"], ind["index"], len(ind["industry"])), ("ind_nifty500list.csv", "Nifty 500", 40))
+        self.assertEqual(ind["industry"]["TCS"], "Information Technology")
+        self.assertEqual(scan.symbols_from_file(self.uni)[:2], ["ADANIENT", "ADANIPORTS"])
+
+        code, text, _ = run(["daily", "--universe", self.uni, "--offline", DAILY, "--nse", NSE, "--now",
+                             "2026-11-24 09:00", "--out", self.wl])
+        self.assertEqual(code, 0)
+        self.assertIn("Fetched 39 of 40 charts (1 failed or had no data). 36 passed the liquidity filter", text)
+        self.assertIn("Official closes: NSE's bhavcopy of 2026-11-23 (sec_bhavdata_full_23112026.csv, the --nse "
+                      "folder) gave the close and the volume of that day for 36 charts that Yahoo had left empty.",
+                      text)
+        self.assertIn("F&O ban list for trade date 25-NOV-2026 (fo_secban.csv): 1 stock; none of the hits is on it. "
+                      "Information only for a cash-segment trade.", text)
+        self.assertIn("1 hit closed within 2 % of the 52-week high, or above it", text)
+        self.assertIn("  RELIANCE       ₹1,351.00  RSI  64.8  bull flag  [delivery 53.9 %; ₹2,094.38 cr traded; "
+                      "Oil Gas & Consumable Fuels]", text)
+        self.assertIn("  EICHERMOT      ₹8,172.50  RSI  71.0  20-day closing-high breakout  [delivery 57.3 %; "
+                      "₹622.53 cr traded; Automobile and Auto Components; near its 52-week high (8,230.00)]", text)
+        with open(self.wl, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        self.assertEqual(doc["nse"], {"session": "2026-11-23", "bhavcopy": "sec_bhavdata_full_23112026.csv",
+                                      "bhavcopy_from": "the --nse folder", "latest_close_from": {"bhavcopy": 36},
+                                      "fno_ban_trade_date": "25-NOV-2026", "fno_ban": ["MANAPPURAM"],
+                                      "high_52w_file": "CM_52_wk_High_low_23112026.csv"})
+        self.assertEqual(doc["hits"][7], {"symbol": "EICHERMOT", "setups": ["breakout_20d"], "price": 8172.5,
+                                          "close_date": "2026-11-23", "rsi": 71.0, "volume": 760976,
+                                          "delivery_pct": 57.26, "turnover_cr": 622.53, "near_52w_high": True,
+                                          "high_52w": 8230.0, "industry": "Automobile and Auto Components"})
+        for h in doc["hits"]:                                               # every old field is still there
+            self.assertLessEqual({"symbol", "setups", "price", "close_date", "rsi", "volume"}, set(h))
+        self.assertEqual(scan.symbols_from_file(self.wl)[:3], ["HDFCBANK", "ICICIBANK", "RELIANCE"])
+        self.assertEqual(sorted(os.listdir(os.path.join(self.t, "state"))), ["industry.json"])   # nothing cached
+
+    def test_a_hit_on_the_ban_list_is_marked(self):
+        nse = os.path.join(self.d, "nse")
+        shutil.copytree(NSE, nse)
+        with open(os.path.join(nse, "fo_secban.csv"), "w", encoding="utf-8") as fh:
+            fh.write("Securities in Ban For Trade Date 25-NOV-2026:\n1,MANAPPURAM\n2,SBIN\n")   # SBIN is made up
+        code, text, _ = run(["daily", "--offline", DAILY, "--nse", nse, "--now", "2026-11-24 09:00", "--out",
+                             self.wl])
+        self.assertIn("F&O ban list for trade date 25-NOV-2026 (fo_secban.csv): 2 stocks; among the hits: SBIN.",
+                      text)
+        self.assertIn("  SBIN           ₹1,132.65  RSI  70.2  bull flag  [delivery 45.7 %; ₹1,712.18 cr traded; "
+                      "in the F&O ban period]", text)                        # no industry.json here: no industry
+        with open(self.wl, encoding="utf-8") as fh:
+            hits = {h["symbol"]: h for h in json.load(fh)["hits"]}
+        self.assertIs(hits["SBIN"]["fno_ban"], True)
+        self.assertNotIn("fno_ban", hits["RELIANCE"])
+        self.assertNotIn("industry", hits["RELIANCE"])
+
+    def test_offline_without_the_nse_files(self):
+        code, text, _ = run(["daily", "--offline", DAILY, "--now", "2026-11-24 09:00", "--out", self.wl])
+        self.assertEqual(code, 0)
+        self.assertIn("NSE's bhavcopy of 2026-11-23 was not used (an offline run without --nse). 36 charts take the "
+                      "session's last traded price from Yahoo as that day's close, not the official close.", text)
+        self.assertNotIn("ban", text)
+        code, text, _ = run(["daily", "--offline", DAILY, "--now", "2026-11-23 09:00", "--no-write"])
+        self.assertIn("NSE's bhavcopy of 2026-11-20 was not used (an offline run without --nse). Closes are Yahoo's "
+                      "own daily bars, and there are no delivery or turnover figures.", text)
+        # a folder without that day's bhavcopy: said plainly, the scan still runs
+        code, text, _ = run(["daily", "--offline", DAILY, "--nse", NSE, "--now", "2026-11-23 09:00", "--no-write"])
+        self.assertEqual(code, 0)
+        self.assertIn("was not used (no sec_bhavdata_full_20112026.csv in the --nse folder)", text)
+        self.assertIn("F&O ban list for trade date 25-NOV-2026", text)
+        self.assertNotIn("52-week", text)
+
+    def test_index_universe_messages(self):
+        code, _, err = run(["universe", "--index", "nifty500", "--offline", os.path.join(self.d, "nope")])
+        self.assertEqual(code, 1)
+        self.assertIn("no ind_nifty500list.csv", err)
+        code, _, err = run(["universe", "--index", "nifty500", "--offline", os.path.join(EQL, "EQUITY_L.csv")])
+        self.assertEqual(code, 1)
+        self.assertIn("not an NSE index constituents list", err)
+        code, text, _ = run(["universe", "--index", "nifty500", "--offline", NSE, "--out", self.uni, "--no-write",
+                             "--json"])
+        out = json.loads(text)
+        self.assertEqual((out["index"], out["count"], out["industries"], out["out"]), ("nifty500", 40, 15, None))
+        self.assertFalse(os.path.exists(self.t))
 
 
 if __name__ == "__main__":

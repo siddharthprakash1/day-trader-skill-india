@@ -1,11 +1,13 @@
 # The Day Trader skill, India
 
-9 Claude skills for day trading Indian stocks on NSE: scan the market for setups, check the news, time every entry and exit, and replay every outcome before you risk a rupee.
+11 Claude skills for day trading Indian stocks on NSE: scan the market for setups, track news and filings, time every entry and exit, and replay every outcome before you risk a rupee.
 
 Free, MIT, no signup, no API key. The tools are plain Python that read free
-public data: Yahoo Finance charts for NSE symbols and NSE's own list of
-listed equities. Everything is in rupees, India Standard Time and NSE hours
-(9:15 AM to 3:30 PM).
+public data: Yahoo Finance charts and quarterly figures for NSE symbols,
+Google News, and the files and RSS feeds NSE publishes itself (the list of
+listed equities, the daily bhavcopy, bulk and block deals, announcements,
+insider-trading and takeover disclosures). Everything is in rupees, India
+Standard Time and NSE hours (9:15 AM to 3:30 PM).
 
 This is a port of Jake Schincariol's
 [day-trader-skill](https://github.com/Jakeschincariol/day-trader-skill),
@@ -43,12 +45,12 @@ method works.
 The tools need Python 3.8 or newer. Nothing to pip install. On Windows the
 command is `python`; on macOS and Linux it is usually `python3`.
 
-## The nine
+## The eleven
 
 | command | job | what it does |
 | --- | --- | --- |
 | `/trader-scanner` | Chart Scanner | Scans NSE stocks for setups: opening-range breakouts, flags, oversold bounces. |
-| `/trader-news` | News Monitor | Shows new Yahoo Finance headlines for the stocks you watch and how far each has moved today. |
+| `/trader-news` | News Monitor | Shows new headlines (Google News) and NSE announcements for the stocks you watch, and how far each has moved today. |
 | `/trader-entry` | Entry Timer | Watches a setup bar by bar and tells you the moment to get in. |
 | `/trader-exit` | Exit Planner | Sets your stop and your target before you enter, so you know when to get out. |
 | `/trader-timemachine` | Time Machine | Replays the rest of the session 10,000 times from the stock's own last 60 days, plus every past day the same rule fired. |
@@ -56,10 +58,14 @@ command is `python`; on macOS and Linux it is usually `python3`.
 | `/trader-risk` | Risk Manager | Checks every trade against your limits and blocks anything over them. |
 | `/trader-broker` | Order Ticket | Prints the order in plain words for you to enter in your broker app, and keeps the log. |
 | `/trader-alerts` | Price Alerts | Rings when a price, a stop, the opening bell or your flat-by time hits. |
+| `/trader-analyst` | Earnings Analyst | Lines up a company's quarterly revenue, profit and EPS and says what changed. |
+| `/trader-insider` | Insider and Big-Deals Tracker | Reads NSE's bulk and block deals and the insider-trading and takeover disclosures as they are published. |
 
-The two US-only skills of the original (the earnings analyst, which reads SEC
-filings, and the tracker of US Congress trade disclosures) are not part of
-this port.
+The original's earnings analyst read SEC filings and its eleventh skill
+tracked US Congress trade disclosures. Here the analyst reads Yahoo's
+quarterly figures and NSE's results feed, and the eleventh skill tracks what
+India publishes instead: bulk and block deals, and the trades promoters and
+directors must disclose.
 
 ## How to use it
 
@@ -69,6 +75,7 @@ what the last one wrote:
 ```
 scanner -> news -> entry -> exit -> timemachine -> budget -> risk -> broker   (one trade)
 alerts: stop, target, flat by 3:00 PM                                         (while it is open)
+news / analyst / insider                                                      (on a schedule)
 ```
 
 An example, replayed on real data: TCS on Monday 23 November 2026. Every
@@ -77,9 +84,9 @@ number below is what the tools printed for that session.
 1. **`/trader-scanner`** at 10:00 AM over 20 large NSE stocks: 5 had closed
    above their 15-minute opening range. TCS is one: range 2,405.00 to
    2,433.70, the 9:40 candle closed at 2,443.50, 0.40 % over the top.
-2. **`/trader-news`**: Yahoo's headline feed for the stock, and how far it is
-   from yesterday's close. Yahoo's coverage of NSE stocks is thin, so check
-   the company's announcements on the NSE or BSE website yourself.
+2. **`/trader-news`**: new headlines for the stock, any NSE announcement
+   it filed, and how far it is from yesterday's close. Headlines are leads:
+   open the story or the filing before you rely on it.
 3. **`/trader-entry`** watched TCS bar by bar. At 9:42 it said waiting (the
    9:40 bar was still forming). At 9:45 it said triggered: the first
    5-minute close above the range, 2,443.50.
@@ -128,6 +135,8 @@ python trader-risk/check.py                                           # PASS / B
 python trader-broker/ticket.py show                                   # the ticket you enter yourself
 python trader-alerts/alerts.py add --from-plan                        # stop, target, flat by 3:00 PM
 python trader-alerts/alerts.py check                                  # rings what hit, once
+python trader-analyst/facts.py TCS                                    # quarters, growth, EPS
+python trader-insider/deals.py new                                    # new deals and disclosures
 ```
 
 ```bash
@@ -147,7 +156,10 @@ The tests run offline, on fixtures cut from real Yahoo data for NSE stocks.
 | Money | dollars | rupees; config keys end in `_inr` |
 | Day defaults | no entries before 9:45 or after 3:30, flat by 3:55 | no entries before 9:30 or after 2:30, flat by 3:00 |
 | Orders | sent to Alpaca or Interactive Brokers after your yes | never sent: a ticket you enter in your own broker app |
-| News | Yahoo headlines and SEC 8-K filings | Yahoo headlines only; exchange filings are not read |
+| News | Yahoo headlines and SEC 8-K filings | Google News by company name, NSE's announcements feed, Yahoo headlines |
+| Earnings | SEC XBRL company facts | Yahoo's quarterly figures (they can have holes) and NSE's results feed |
+| Disclosures | US Congress trade reports | NSE bulk and block deals, insider-trading and takeover disclosures |
+| Daily closes | Yahoo | Yahoo, with NSE's official bhavcopy for the latest session |
 | US rules | pattern-day-trader guard, fractional shares | removed |
 
 ## Fine print
@@ -194,6 +206,27 @@ Check anything that matters against your broker before you act on it.
 selling. Stocks in the BE (trade-for-trade) series cannot be traded intraday
 and are left out of the universe.
 
+**Only openly published data.** The tools read files and feeds that NSE,
+Google News and Yahoo publish without a login. They do not use the exchange
+websites' internal APIs and do not try to get past bot checks. NSE's RSS
+feeds are short rolling windows, so a filing can scroll off before a check
+sees it; BSE-only filings are not read.
+
+**Yahoo's quarterly figures for Indian companies are patchy.** In testing,
+none of ten large companies came back complete: quarters were missing, one
+bank's figures were over a year old and one company was reported in US
+dollars. `/trader-analyst` shows every gap and never computes growth across
+one. Read the company's own results filing before relying on a number.
+
+**NSE's insider-trading feed can be stale.** When this was written its
+newest item was months old, while bulk deals, block deals and takeover
+disclosures were current. `/trader-insider` prints how fresh each source is
+on every run.
+
+**Disclosures are public and late.** Bulk deals, block deals and insider
+disclosures are published after the trade. There is no inside information
+here, and copying anyone is not a strategy.
+
 **Holidays.** The NSE holiday list for 2026 is built in. For any other year
 the tools only know weekends, and say so. The Muhurat session is treated as
 a closed day.
@@ -213,6 +246,8 @@ trader-risk/        SKILL.md, check.py
 trader-budget/      SKILL.md, size.py, config.example.json
 trader-broker/      SKILL.md, ticket.py
 trader-alerts/      SKILL.md, alerts.py, alerts.example.json
+trader-analyst/     SKILL.md, facts.py, metrics.example.json
+trader-insider/     SKILL.md, deals.py
 tests/              unittest suite + offline fixtures
 ```
 

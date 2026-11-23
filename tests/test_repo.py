@@ -5,16 +5,17 @@ import unittest
 
 from _load import ROOT
 
-# the Indian market (NSE) port: nine skill folders
+# the Indian market (NSE) port: eleven skill folders
 SKILLS = ["trader-scanner", "trader-news", "trader-entry", "trader-exit", "trader-timemachine",
-          "trader-risk", "trader-budget", "trader-broker", "trader-alerts"]
-ABOUT = ("9 Claude skills for day trading Indian stocks on NSE: scan the market for setups, check the news, "
-         "time every entry and exit, and replay every outcome before you risk a rupee.")
+          "trader-risk", "trader-budget", "trader-broker", "trader-alerts", "trader-analyst",
+          "trader-insider"]
+ABOUT = ("11 Claude skills for day trading Indian stocks on NSE: scan the market for setups, track news and "
+         "filings, time every entry and exit, and replay every outcome before you risk a rupee.")
 # skills on the way to an order carry the safety block
 ORDER_PATH = ["trader-scanner", "trader-entry", "trader-exit", "trader-timemachine", "trader-budget",
-              "trader-risk", "trader-broker", "trader-alerts"]
+              "trader-insider", "trader-risk", "trader-broker", "trader-alerts"]
 # US-only things that must not survive the port, outside the README's and LICENSE's credit to the original
-US_ONLY = ["trader-analyst", "trader-pelosi", "trader-copycat", "trader-screener", "trader-tax",
+US_ONLY = ["trader-pelosi", "EDGAR", "companyfacts", "trader-copycat", "trader-screener", "trader-tax",
            "trader-rebalance", "alpaca", "Alpaca", "place_stock_order", "pdt_guard", "sec_user_agent",
            "New York", "NYSE", "_usd"]
 
@@ -35,7 +36,7 @@ def every_text_file():
 
 
 class Repo(unittest.TestCase):
-    def test_nine_skill_folders_at_the_root(self):
+    def test_eleven_skill_folders_at_the_root(self):
         found = sorted(d for d in os.listdir(ROOT)
                        if os.path.isfile(os.path.join(ROOT, d, "SKILL.md")))
         self.assertEqual(found, sorted(SKILLS))
