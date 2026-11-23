@@ -1,0 +1,22 @@
+{
+  "created_by": "hand-made fixture in the shape of trader-exit's plan.json",
+  "symbol": "TCS",
+  "side": "buy",
+  "date": "2026-11-23",
+  "setup": "orb",
+  "entry": 2443.5,
+  "entry_time": "9:45 AM",
+  "entry_bar": "09:40",
+  "interval": "5m",
+  "opening_range": {"high": 2433.7, "low": 2405.0, "minutes": 15},
+  "stop": 2419.35,
+  "stop_rule": "or-mid",
+  "stop_label": "opening-range midpoint",
+  "target": 2467.65,
+  "target_r": 1.0,
+  "target_label": "1R",
+  "risk_per_share": 24.15,
+  "reward_risk": 1.0,
+  "flat_by": "15:00",
+  "note": "Built by hand from Yahoo's TCS.NS 5-minute bars for Monday 2026-11-23 (tcs-5m-2026-11-23.json): the 09:15, 09:20 and 09:25 bars give the range 2405.00 to 2433.70; the 09:40 bar is the first to close above 2433.70, at 2443.50, and it completes at 09:45. Stop = range midpoint 2419.35, target = entry + 1 x risk."
+}

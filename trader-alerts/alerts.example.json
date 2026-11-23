@@ -1,0 +1,9 @@
+{
+  "rules": [
+    {"id": "opening-bell", "type": "opening_bell"},
+    {"id": "tcs-plan-stop", "symbol": "TCS", "type": "stop", "price": 2419.35, "note": "plan stop: opening-range midpoint", "date": "2026-11-23"},
+    {"id": "tcs-plan-target", "symbol": "TCS", "type": "target", "price": 2467.65, "note": "plan target: 1R (one times the risk)", "date": "2026-11-23"},
+    {"id": "tcs-flat-by", "symbol": "TCS", "type": "time", "at": "15:00", "label": "flat by 15:00", "date": "2026-11-23"},
+    {"id": "m&m-move-3", "symbol": "M&M", "type": "pct_move", "pct": 3}
+  ]
+}

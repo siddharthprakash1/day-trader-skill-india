@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "day-trader-skill-india",
+  "description": "The Day Trader skill pack for Claude, ported to the Indian stock market (NSE)",
+  "owner": {
+    "name": "siddharthprakash1",
+    "url": "https://github.com/siddharthprakash1"
+  },
+  "plugins": [
+    {
+      "name": "day-trader-skill-india",
+      "description": "Nine Claude skills for day trading NSE stocks: a chart scanner, a news monitor, an entry timer, an exit planner, a time machine that replays 10,000 sessions, a risk manager, a budget manager, an order ticket you enter yourself in your broker app, and price alerts. Rupees, IST and NSE hours. Nothing places an order for you.",
+      "source": "./",
+      "category": "productivity",
+      "homepage": "https://github.com/siddharthprakash1/day-trader-skill-india"
+    }
+  ]
+}

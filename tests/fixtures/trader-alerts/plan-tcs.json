@@ -1,0 +1,21 @@
+{
+  "created_by": "trader-exit",
+  "symbol": "TCS",
+  "side": "buy",
+  "date": "2026-11-23",
+  "setup": "orb",
+  "entry": 2443.5,
+  "entry_time": "9:45 AM",
+  "entry_bar": 5,
+  "interval": "5m",
+  "opening_range": {"high": 2433.7, "low": 2405.0, "minutes": 15},
+  "stop": 2419.35,
+  "stop_rule": "or_mid",
+  "stop_label": "opening-range midpoint",
+  "target": 2467.65,
+  "target_r": 1.0,
+  "target_label": "1R (one times the risk)",
+  "risk_per_share": 24.15,
+  "reward_risk": 1.0,
+  "flat_by": "15:00"
+}
