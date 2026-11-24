@@ -1,6 +1,6 @@
 # The Day Trader skill, India
 
-12 Claude skills for day trading Indian stocks on NSE: scan the market for setups, track news and filings, time every entry and exit, replay every outcome before you risk a rupee, and score your practice trades after charges.
+14 Claude skills for day trading Indian stocks on NSE: read the market's health, scan for setups, track news and filings, time every entry and exit, replay and backtest before you risk a rupee, and score your practice trades after charges.
 
 Free, MIT, no signup, no API key. The tools are plain Python that read free
 public data: Yahoo Finance charts and quarterly figures for NSE symbols,
@@ -45,22 +45,24 @@ method works.
 The tools need Python 3.8 or newer. Nothing to pip install. On Windows the
 command is `python`; on macOS and Linux it is usually `python3`.
 
-## The twelve
+## The fourteen
 
 | command | job | what it does |
 | --- | --- | --- |
+| `/trader-market` | Market Health Check | Reads the last session's breadth, 52-week highs and lows, the Nifty 50 trend and India VIX, and says by printed rules whether the backdrop suits long breakouts. |
 | `/trader-scanner` | Chart Scanner | Scans NSE stocks for setups: opening-range breakouts, flags, oversold bounces. |
 | `/trader-news` | News Monitor | Shows new headlines (Google News) and NSE announcements for the stocks you watch, and how far each has moved today. |
-| `/trader-entry` | Entry Timer | Watches a setup bar by bar and tells you the moment to get in. |
+| `/trader-entry` | Entry Timer | Watches a setup bar by bar (opening-range breakout, VWAP reclaim, gap and go) and tells you the moment to get in. |
 | `/trader-exit` | Exit Planner | Sets your stop and your target before you enter, so you know when to get out. |
 | `/trader-timemachine` | Time Machine | Replays the rest of the session 10,000 times from the stock's own last 60 days, plus every past day the same rule fired. |
 | `/trader-budget` | Budget Manager | Sizes every position to your budget and your max loss per trade, in whole shares. |
-| `/trader-risk` | Risk Manager | Checks every trade against your limits and blocks anything over them. |
+| `/trader-risk` | Risk Manager | Checks every trade against your limits and blocks anything over them, with a circuit breaker after a daily loss, a losing streak or a fresh loss. |
 | `/trader-broker` | Order Ticket | Prints the order in plain words for you to enter in your broker app, and keeps the log. |
 | `/trader-alerts` | Price Alerts | Rings when a price, a stop, the opening bell or your flat-by time hits. |
 | `/trader-analyst` | Earnings Analyst | Lines up a company's quarterly revenue, profit and EPS and says what changed. |
 | `/trader-insider` | Insider and Big-Deals Tracker | Reads NSE's bulk and block deals and the insider-trading and takeover disclosures as they are published. |
 | `/trader-journal` | Practice Journal | Scores every practice trade against what the price really did, after brokerage and taxes, and keeps the scoreboard. |
+| `/trader-backtest` | Setup Backtest | Runs each setup over the last 60 days of 5-minute bars across many stocks and reports the results after charges, with the caveats. |
 
 The original's earnings analyst read SEC filings and its eleventh skill
 tracked US Congress trade disclosures. Here the analyst reads Yahoo's
@@ -74,9 +76,10 @@ Everything lands in a `trader/` folder in your project, and each skill reads
 what the last one wrote:
 
 ```
-scanner -> news -> entry -> exit -> timemachine -> budget -> risk -> broker   (one trade)
+market -> scanner -> news -> entry -> exit -> timemachine -> budget -> risk -> broker   (one trade)
 alerts: stop, target, flat by 3:00 PM                                         (while it is open)
 journal: score it after the close, read the scoreboard                        (every day)
+backtest: which setup held up over the last 60 days, after charges            (now and then)
 news / analyst / insider                                                      (on a schedule)
 ```
 
@@ -124,16 +127,19 @@ All standard-library Python. The data tools read public endpoints and are
 polite about it.
 
 ```bash
+python trader-market/market.py check                                  # breadth, trend, VIX and the reading
 python trader-scanner/scan.py universe                                # NSE's EQ-series stocks
 python trader-scanner/scan.py daily                                   # setups on daily closes, whole universe
 python trader-scanner/scan.py orb --at 10:00                          # opening-range breakouts so far
 python trader-news/news.py --tickers RELIANCE TCS --hours 12          # headlines and today's move
 python trader-entry/entry.py check TCS --setup orb                    # waiting / triggered / expired
 python trader-entry/entry.py watch TCS --every 30                     # bar by bar until it triggers
+python trader-entry/entry.py check TCS --setup vwap                   # or --setup gap: the other two setups
 python trader-exit/exit.py plan --stop or-mid --target 1R --write     # -> trader/plan.json
 python trader-timemachine/timemachine.py run --write                  # 10,000 replays + the history
 python trader-budget/size.py --write                                  # -> trader/orders.json
 python trader-risk/check.py                                           # PASS / BLOCK per order
+python trader-risk/check.py breaker                                   # the circuit breaker right now
 python trader-broker/ticket.py show                                   # the ticket you enter yourself
 python trader-alerts/alerts.py add --from-plan                        # stop, target, flat by 3:00 PM
 python trader-alerts/alerts.py check                                  # rings what hit, once
@@ -142,6 +148,7 @@ python trader-insider/deals.py new                                    # new deal
 python trader-journal/journal.py charges --plan                       # what the plan costs in charges
 python trader-journal/journal.py score                                # score the day's trades
 python trader-journal/journal.py report                               # the scoreboard
+python trader-backtest/backtest.py run --universe nifty500 --limit 40 # each setup over 60 days, after charges
 ```
 
 ```bash
@@ -257,6 +264,8 @@ trader-alerts/      SKILL.md, alerts.py, alerts.example.json
 trader-analyst/     SKILL.md, facts.py, metrics.example.json
 trader-insider/     SKILL.md, deals.py
 trader-journal/     SKILL.md, journal.py
+trader-market/      SKILL.md, market.py
+trader-backtest/    SKILL.md, backtest.py
 tests/              unittest suite + offline fixtures
 ```
 

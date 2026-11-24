@@ -18,5 +18,11 @@
   "blocked": [],
   "allow_options": false,
   "allow_margin": false,
-  "allow_short": false
+  "allow_short": false,
+  "circuit_breaker": true,
+  "loss_streak_limit": 3,
+  "loss_streak_cooldown_minutes": null,
+  "reentry_cooldown_minutes": 30,
+  "block_reentry_after_stop": true,
+  "max_weekly_loss_inr": null
 }

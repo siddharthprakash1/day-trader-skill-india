@@ -7,6 +7,8 @@ places an order.
     python entry.py check TCS --now "2026-11-23 09:45" --offline TCS.json
     python entry.py check TCS --setup level --level 2450        # first close above a price
     python entry.py check TCS --interval 1m --min-volume-x 1.5 --write
+    python entry.py check TCS --setup vwap                      # first close back above VWAP
+    python entry.py check TCS --setup gap --gap-pct 1           # gap up, then a close above the range high
     python entry.py watch TCS --every 30 --until 14:30   # one line per closed bar
     python entry.py watchlist                            # every hit in trader/watchlist.json
 
@@ -21,9 +23,35 @@ Setups (long side only):
          above the range high. A wick above the high is not a trigger.
   level  the first completed bar that closes above --level (for example a
          20-day high from trader-scanner).
+  vwap   VWAP reclaim. VWAP is the session's volume-weighted average price,
+         worked out from the day's own bars from 09:15: the sum of typical
+         price x volume over the sum of volume, typical price = (high + low +
+         close) / 3. It triggers on the first completed bar that CLOSES above
+         VWAP right after at least --min-bars-below bars (default 3) in a row
+         closed at or under it. A bar with no volume keeps its close but adds
+         nothing to VWAP; a missing bar breaks the run (its close is unknown).
+         When no bar so far has any volume, VWAP cannot be computed and the
+         tool says so. Natural stop: the lowest low of that run of bars and
+         the trigger bar (the pullback low).
+  gap    gap and go. The day's open (the open of the 09:15 bar) is at least
+         --gap-pct percent (default 1.0) above the previous close, and the
+         trigger is the first completed bar after the opening range that
+         CLOSES above the opening-range high (the same trigger as orb, on gap
+         days only). A day that opens with a smaller gap is "expired" at once.
+         Natural stop: the opening-range low.
   --min-volume-x X  the trigger bar also needs at least X times the average
          volume of the opening-range bars (the 9:15 bar carries the opening
-         rush, so 1.0 is already a high bar).
+         rush, so 1.0 is already a high bar). For vwap: X times the average
+         volume of the earlier bars of the session that had volume.
+
+vwap and gap write a "stop_ref" into trader/entry.json: the natural stop and
+the exact trader-exit flag that sets it (--stop price:X, or --stop or-low).
+trader-exit only defaults a stop for orb, so these two always need the flag.
+
+The previous close for gap: Yahoo's own previous close when the chart holds
+one session (a live check), else the close of the previous session's last
+five-minute bar in the chart (a replayed day). Neither is NSE's official
+close, which is a weighted average of the last half hour.
 
 A trigger's time is the trigger bar's CLOSE time (the 9:40 bar closes at
 9:45 AM) and its price is that close, to the paisa. Only bars on the interval
@@ -79,6 +107,10 @@ SETTLE = 60      # seconds a closed bar may wait for Yahoo's data to catch up
 HOSTS = ("query2", "query1")
 INTERVALS = {"1m": 60, "5m": 300}
 DEFAULTS = {"no_entries_before": "09:30", "no_entries_after": "14:30"}
+SETUPS = ("orb", "level", "vwap", "gap")
+RANGED = ("orb", "gap")          # setups whose level is the opening-range high
+MIN_BARS_BELOW = 3               # vwap: bars in a row at or under VWAP before a reclaim counts
+GAP_PCT = 1.0                    # gap: the open is at least this percent above the previous close
 EPOCH = datetime.datetime(1970, 1, 1)
 
 IST = datetime.timedelta(hours=5, minutes=30)   # India Standard Time: fixed, no daylight saving
@@ -330,6 +362,7 @@ def parse_chart(text, sym):
                      "l": float(c if lo is None else lo), "c": float(c), "v": int(at("volume", i) or 0)})
     return {"symbol": nse_symbol(meta.get("symbol") or sym), "meta": meta, "bars": bars,
             "prev_close": meta.get("previousClose") or meta.get("chartPreviousClose"),
+            "chart_prev_close": meta.get("chartPreviousClose"),
             "data_time": meta.get("regularMarketTime")}
 
 
@@ -401,8 +434,48 @@ def r2(x):
     return None if x is None else round(float(x), 2) + 0.0   # + 0.0 turns -0.0 into 0.0
 
 
+def session_vwap(bars):
+    """Running session VWAP after each bar, oldest first: sum(typical price x volume) /
+    sum(volume), typical price = (high + low + close) / 3. A bar without volume adds
+    nothing. None while no bar so far has had any volume."""
+    out, cum_v, cum_pv = [], 0.0, 0.0
+    for b in bars:
+        v = b.get("v") or 0
+        if v > 0:
+            cum_v += v
+            cum_pv += (b["h"] + b["l"] + b["c"]) / 3.0 * v
+        out.append(cum_pv / cum_v if cum_v > 0 else None)
+    return out
+
+
+def previous_close(chart, day, step):
+    """(price, where from) for the session before `day`, or (None, why). When the chart
+    holds earlier sessions (a replayed day), the close of the previous session's last bar;
+    when `day` is the chart's first session, Yahoo's own previous close."""
+    best = None
+    for b in chart["bars"]:
+        if b["t"] % step:
+            continue
+        et = to_ist(utc_of(b["t"]))
+        if et.date() >= day or not (OPEN <= et.time() < CLOSE):
+            continue
+        if best is None or b["t"] > best[0]:
+            best = (b["t"], b["c"], et)
+    if best:
+        return best[1], "the %s bar of %s, the last one before it in Yahoo's data" % (
+            hm(best[2]), best[2].date().isoformat())
+    pc = chart.get("chart_prev_close") or chart.get("prev_close")
+    if pc:
+        return float(pc), "Yahoo's previous close"
+    return None, "Yahoo sent no previous close"
+
+
+def level_words(setup):
+    return {"orb": "the range high", "gap": "the range high", "vwap": "VWAP"}.get(setup, "the level")
+
+
 def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=None,
-             min_volume_x=None, cfg=None):
+             min_volume_x=None, cfg=None, min_bars_below=MIN_BARS_BELOW, gap_pct=GAP_PCT):
     """Pure function: the setup's status at now_utc from one session's bars."""
     cfg = cfg or dict(DEFAULTS)
     if interval not in INTERVALS:
@@ -410,8 +483,12 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     step = INTERVALS[interval]
     if or_minutes <= 0 or (or_minutes * 60) % step:
         raise EntryError("--or-minutes must be a whole number of %s bars" % interval)
-    if setup not in ("orb", "level"):
-        raise EntryError("--setup is orb or level")
+    if setup not in SETUPS:
+        raise EntryError("--setup is orb, level, vwap or gap")
+    if setup == "vwap" and int(min_bars_below) < 1:
+        raise EntryError("--min-bars-below must be 1 or more")
+    if setup == "gap" and not float(gap_pct) > 0:
+        raise EntryError("--gap-pct must be above 0")
     if setup == "level" and level is None:
         raise EntryError("--setup level needs --level PRICE (for example a 20-day high)")
     n_or = or_minutes * 60 // step
@@ -470,7 +547,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
 
     if local < open_dt:
         res.update(phase="pre-open", reason="the NSE opens at %s%s" % (short(o), 
-            " and the %d-minute range is set at %s" % (or_minutes, short(or_end)) if setup == "orb" else ""))
+            " and the %d-minute range is set at %s" % (or_minutes, short(or_end)) if setup in RANGED else ""))
         return res
 
     or_bars = [b for b in bars if b["slot"] < n_or]
@@ -479,7 +556,30 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         res["opening_range"] = {"high": r2(max(b["h"] for b in or_bars)), "low": r2(min(b["l"] for b in or_bars)),
                                 "minutes": or_minutes, "bars": len(or_bars), "of": n_or,
                                 "complete": local >= or_end, "avg_volume": int(round(avg_vol))}
-    if setup == "orb":
+    if setup == "vwap":
+        return _vwap_reclaim(res, bars, pending, local, before, cutoff, close_dt, dt,
+                             int(min_bars_below), min_volume_x)
+    if setup == "gap":
+        first = next((b for b in bars if b["slot"] == 0), None)
+        if first is None and local >= or_end:
+            res.update(status="no-data", phase="open",
+                       reason="Yahoo sent no 9:15 bar, so the gap at the open cannot be measured")
+            return res
+        if first is not None:
+            pc, where = previous_close(chart, day, step)
+            if pc is None:
+                res.update(status="no-data", phase="open", reason="%s, so the gap cannot be measured" % where)
+                return res
+            pct = 100.0 * (first["o"] / pc - 1)
+            res["prev_close"] = r2(pc)
+            res["gap"] = {"open": r2(first["o"]), "prev_close": r2(pc), "pct": r2(pct), "min_pct": float(gap_pct),
+                          "prev_close_from": where}
+            if pct < float(gap_pct):
+                res.update(status="expired", phase="no-gap",
+                           reason="it opened at %s, %+.2f%% from the previous close %s: gap and go needs "
+                                  "%+.2f%% or more" % (rs(first["o"]), pct, rs(pc), float(gap_pct)))
+                return res
+    if setup in RANGED:
         if local < or_end:
             res.update(phase="forming", reason="%d of %d range bars closed; the range is set at %s" % (
                 len(or_bars), n_or, short(or_end)))
@@ -492,7 +592,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         lvl = float(level)
     res["level"] = r2(lvl)
 
-    first_slot = n_or if setup == "orb" else 0
+    first_slot = n_or if setup in RANGED else 0
     trig, thin = None, []
     for b in bars:
         if b["slot"] < first_slot or b["end"] < before or b["end"] > cutoff:
@@ -512,7 +612,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     if trig:
         vx = (trig["v"] / avg_vol) if avg_vol else None
         res.update(status="triggered", phase="open" if local < close_dt else "after-close",
-                   reason="the %s bar closed above %s" % (short(trig["et"]), "the range high" if setup == "orb" else "the level"))
+                   reason="the %s bar closed above %s" % (short(trig["et"]), level_words(setup)))
         res["trigger"] = {"time": ampm(trig["end"]), "close_time": hm(trig["end"]), "bar_start": hm(trig["et"]),
                           "bar_index": trig["slot"], "price": r2(trig["c"]), "close": trig["c"],
                           "volume": trig["v"], "volume_x": r2(vx), "pct_over": r2(100.0 * (trig["c"] / lvl - 1))}
@@ -520,11 +620,15 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         if dt and utc_of(dt) < ist_to_utc(trig["end"]):
             res["data_note"] = ("Yahoo's last trade is %s, before this bar closed: its close can still move a little"
                                 % to_ist(utc_of(dt)).strftime("%H:%M:%S"))
+        if setup == "gap":
+            low = min(b["l"] for b in or_bars)
+            res["stop_ref"] = {"price": r2(low), "rule": "or-low", "what": "the opening-range low",
+                               "exit_flag": "--stop or-low"}
         return res
     if not bars:
         res.update(status="no-data", phase="open", reason="Yahoo sent no bars for %s yet" % day.isoformat())
         return res
-    what = "close above the range high %s" % rs(lvl) if setup == "orb" else "close above %s" % rs(lvl)
+    what = "close above the range high %s" % rs(lvl) if setup in RANGED else "close above %s" % rs(lvl)
     if local >= cutoff and not (pending and pending["end"] <= cutoff):
         res.update(status="expired", phase="after-close" if local >= close_dt else "after-cutoff",
                    reason="no %s by %s, the last time for a new entry" % (what, short(cutoff)))
@@ -540,8 +644,95 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         gap = lvl - last["c"]
         res["reason"] = "last close %s (%s bar), %s %s %s (%+.2f%%)" % (
             rs(last["c"]), short(last["et"]), rs(abs(gap)), "under" if gap >= 0 else "over",
-            "the range high %s" % rs(lvl) if setup == "orb" else "the level %s" % rs(lvl),
+            "the range high %s" % rs(lvl) if setup in RANGED else "the level %s" % rs(lvl),
             100.0 * (last["c"] / lvl - 1))
+    return res
+
+
+def _vwap_reclaim(res, bars, pending, local, before, cutoff, close_dt, dt, need, min_volume_x):
+    """The vwap setup on the closed bars (see the docstring at the top). Fills res."""
+    if not bars:
+        res.update(status="no-data", phase="open", reason="Yahoo sent no bars for %s yet" % res["date"])
+        return res
+    vw = session_vwap(bars)
+    no_vol = sum(1 for b in bars if not b["v"])
+    holes = bars[-1]["slot"] + 1 - len(bars)
+    trig, thin, run, run_low, prev_slot = None, [], 0, None, None
+    vol_n, vol_sum, trig_avg, trig_run, stop = 0, 0.0, None, 0, None
+    for b, v in zip(bars, vw):
+        b["vwap"] = v
+        if prev_slot is not None and b["slot"] != prev_slot + 1:
+            run, run_low = 0, None                # a missing bar: its close is unknown, start again
+        prev_slot = b["slot"]
+        avg = (vol_sum / vol_n) if vol_n else None     # the earlier bars only
+        if b["v"] > 0:
+            vol_n += 1
+            vol_sum += b["v"]
+        if v is None:
+            run, run_low = 0, None
+            b["below"] = 0
+            continue
+        if b["c"] > v:
+            if trig is None and run >= need and before <= b["end"] <= cutoff:
+                vx = (b["v"] / avg) if avg else None
+                if min_volume_x and (vx is None or vx < min_volume_x):
+                    thin.append(b)
+                    b["thin_x"] = vx or 0.0
+                else:
+                    trig, trig_avg, trig_run = b, avg, run
+                    stop = min(run_low, b["l"])
+            run, run_low = 0, None
+        else:
+            run += 1
+            run_low = b["l"] if run_low is None else min(run_low, b["l"])
+        b["below"] = run
+    last = bars[-1]
+    cur = vw[-1]
+    res["vwap"] = {"value": r2(cur), "bars_below": last.get("below", 0), "min_bars_below": need,
+                   "bars_without_volume": no_vol, "missing_bars": holes}
+    if cur is None:
+        res.update(status="no-data", phase="open",
+                   reason="VWAP could not be computed: Yahoo sent no volume for %s on %s" % (res["symbol"], res["date"]))
+        return res
+    lvl = trig["vwap"] if trig else cur
+    res["level"] = r2(lvl)
+    res["last"] = {"bar_start": hm(last["et"]), "close": r2(last["c"]), "vs_level_pct": r2(100.0 * (last["c"] / cur - 1))}
+    if trig:
+        vx = (trig["v"] / trig_avg) if trig_avg else None
+        res.update(status="triggered", phase="open" if local < close_dt else "after-close",
+                   reason="the %s bar closed above VWAP after %d bars at or under it" % (short(trig["et"]), trig_run))
+        res["trigger"] = {"time": ampm(trig["end"]), "close_time": hm(trig["end"]), "bar_start": hm(trig["et"]),
+                          "bar_index": trig["slot"], "price": r2(trig["c"]), "close": trig["c"],
+                          "volume": trig["v"], "volume_x": r2(vx), "pct_over": r2(100.0 * (trig["c"] / lvl - 1)),
+                          "vwap": r2(lvl), "bars_below": trig_run}
+        res["stop_ref"] = {"price": r2(stop), "rule": "price",
+                           "what": "the pullback low (the lowest low of the %d bars at or under VWAP and the "
+                                   "trigger bar)" % trig_run,
+                           "exit_flag": "--stop price:%.2f" % r2(stop)}
+        res["minutes_since"] = int((local - trig["end"]).total_seconds() // 60)
+        if dt and utc_of(dt) < ist_to_utc(trig["end"]):
+            res["data_note"] = ("Yahoo's last trade is %s, before this bar closed: its close can still move a little"
+                                % to_ist(utc_of(dt)).strftime("%H:%M:%S"))
+        return res
+    if local >= cutoff and not (pending and pending["end"] <= cutoff):
+        res.update(status="expired", phase="after-close" if local >= close_dt else "after-cutoff",
+                   reason="no close back above VWAP after %d bars at or under it by %s, the last time for a new entry"
+                          % (need, short(cutoff)))
+        return res
+    res["phase"] = "open"
+    gap = cur - last["c"]
+    if last in thin:
+        res["reason"] = ("the %s bar closed back above VWAP at %s but on %.2fx the session's average volume, "
+                         "under your %.2fx" % (short(last["et"]), rs(last["c"]), last.get("thin_x") or 0, min_volume_x))
+    elif last["c"] > cur:
+        res["reason"] = ("last close %s (%s bar), %s over VWAP %s (%+.2f%%): a reclaim needs %d bars in a row at or "
+                         "under VWAP first, then a close back above" % (
+                             rs(last["c"]), short(last["et"]), rs(-gap), rs(cur), 100.0 * (last["c"] / cur - 1), need))
+    else:
+        n = last.get("below", 0)
+        res["reason"] = "last close %s (%s bar), %s under VWAP %s (%+.2f%%); %d bar%s in a row at or under it, %s" % (
+            rs(last["c"]), short(last["et"]), rs(gap), rs(cur), 100.0 * (last["c"] / cur - 1), n, "" if n == 1 else "s",
+            "the next close above VWAP is the trigger" if n >= need else "a reclaim needs %d" % need)
     return res
 
 
@@ -554,12 +745,17 @@ def entry_doc(res, now_utc):
     """trader/entry.json, the contract shape (plus a plain-words reason)."""
     t = res.get("trigger") or {}
     orr = res.get("opening_range")
-    return {"created_by": "trader-entry", "symbol": res["symbol"], "setup": res["setup"], "side": "buy",
-            "date": res["date"], "status": res["status"], "time": t.get("time"), "bar_start": t.get("bar_start"),
-            "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
-            "interval": res["interval"],
-            "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
-            "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
+    doc = {"created_by": "trader-entry", "symbol": res["symbol"], "setup": res["setup"], "side": "buy",
+           "date": res["date"], "status": res["status"], "time": t.get("time"), "bar_start": t.get("bar_start"),
+           "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
+           "interval": res["interval"],
+           "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
+           "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
+    if res["setup"] in ("vwap", "gap"):
+        # extra, for people and for the trader-exit flag: trader-exit itself does not read these
+        doc["stop_ref"] = res.get("stop_ref")
+        doc[res["setup"]] = res.get(res["setup"])
+    return doc
 
 
 def write_json(path, doc):
@@ -581,6 +777,10 @@ SHORT = {"pre-open": "not open", "forming": "forming", "closed": "closed"}
 def setup_name(res):
     if res["setup"] == "orb":
         return "opening-range breakout (%d-minute range)" % res["or_minutes"]
+    if res["setup"] == "vwap":
+        return "VWAP reclaim"
+    if res["setup"] == "gap":
+        return "gap and go (%d-minute range)" % res["or_minutes"]
     return "close above %s" % rs(res["level"]) if res["level"] is not None else "close above a level"
 
 
@@ -593,7 +793,22 @@ def describe(res):
     if res.get("data_time") and res["data_time"] <= res["now"] and res["data_time"][:10] == res["date"]:
         head += ", data to %s" % res["data_time"][11:]
     out = [head]
-    orr = res.get("opening_range")
+    orr = res.get("opening_range") if res["setup"] != "vwap" else None
+    g = res.get("gap")
+    if g:
+        out.append("Gap: opened at %s, %+.2f%% from the previous close %s (%s). Gap and go needs %+.2f%% or more." % (
+            rs(g["open"]), g["pct"], rs(g["prev_close"]), g["prev_close_from"], g["min_pct"]))
+    vw = res.get("vwap")
+    if vw and vw.get("value") is not None:
+        notes = []
+        if vw["bars_without_volume"]:
+            notes.append("%d bar%s with no volume left out" % (vw["bars_without_volume"],
+                                                               "" if vw["bars_without_volume"] == 1 else "s"))
+        if vw["missing_bars"]:
+            notes.append("%d bar%s missing from Yahoo's data" % (vw["missing_bars"],
+                                                                 "" if vw["missing_bars"] == 1 else "s"))
+        out.append("Session VWAP %s from 9:15 on the day's own bars%s." % (
+            rs(vw["value"]), (" (%s)" % ", ".join(notes)) if notes else ""))
     if orr:
         start = datetime.datetime.strptime(res["opens"], "%H:%M")
         end = start + datetime.timedelta(minutes=orr["minutes"])
@@ -603,10 +818,12 @@ def describe(res):
     label = PHASE_LABEL.get(res["phase"]) or LABEL.get(res["status"], res["status"].upper())
     t = res.get("trigger")
     if t:
-        out.append("TRIGGERED %s at %s: the %s bar (bar %d) closed above %s %s (%+.2f%%%s)." % (
+        out.append("TRIGGERED %s at %s: the %s bar (bar %d) closed above %s %s (%+.2f%%%s)%s." % (
             t["time"], rs(t["price"]), short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
-            "the range high" if res["setup"] == "orb" else "the level", rs(res["level"]), t["pct_over"],
-            (", %.2fx the range's volume" % t["volume_x"]) if res.get("min_volume_x") and t.get("volume_x") else ""))
+            level_words(res["setup"]), rs(res["level"]), t["pct_over"],
+            (", %.2fx the %s volume" % (t["volume_x"], "session's average" if res["setup"] == "vwap" else "range's"))
+            if res.get("min_volume_x") and t.get("volume_x") else "",
+            (" after %d bars at or under it" % t["bars_below"]) if res["setup"] == "vwap" else ""))
         step = INTERVALS[res["interval"]] // 60
         if res.get("minutes_since", 0) > step and res.get("last"):
             out.append("That was %d minutes ago; the last close is %s (%s bar). A late entry is a different "
@@ -618,8 +835,14 @@ def describe(res):
             out.append("Nothing was placed.")
         else:
             out.append("This is the moment to get in, if you take the trade. Nothing was placed.")
-        out.append("Next: set the stop and target BEFORE you buy: /trader-exit "
-                   "(exit.py plan --from trader/entry.json).")
+        sr = res.get("stop_ref")
+        if sr:
+            out.append("Natural stop for this setup: %s, %s." % (rs(sr["price"]), sr["what"]))
+            out.append("Next: set the stop and target BEFORE you buy: /trader-exit "
+                       "(exit.py plan --from trader/entry.json %s)." % sr["exit_flag"])
+        else:
+            out.append("Next: set the stop and target BEFORE you buy: /trader-exit "
+                       "(exit.py plan --from trader/entry.json).")
     else:
         out.append("%s  %s." % (label, res["reason"]))
         f = res.get("forming")
@@ -645,7 +868,21 @@ def bar_line(b, res):
     lvl = res.get("level")
     t = res.get("trigger")
     n_or = orr.get("of") or 0
-    if res["setup"] == "orb" and b["slot"] < n_or:
+    if res["setup"] == "vwap":
+        v = b.get("vwap")
+        if t and t["bar_index"] == b["slot"]:
+            note = ("TRIGGERED: closed above VWAP %s (%+.2f%%) after %d bars at or under it. Get in now if you "
+                    "take it: %s, %s" % (rs(t["vwap"]), t["pct_over"], t["bars_below"], t["time"], rs(t["price"])))
+        elif v is None:
+            note = "no volume yet, so no VWAP"
+        elif b["c"] > v:
+            note = "%s over VWAP %s" % (rs(b["c"] - v), rs(v))
+            if b.get("thin_x") is not None:
+                note += ", but volume %.2fx is under %.2fx" % (b["thin_x"], res["min_volume_x"])
+        else:
+            note = "%s under VWAP %s (%d in a row)" % (rs(v - b["c"]), rs(v), b.get("below", 0))
+        return "%5s bar  closed %s  %s" % (start, rs(b["c"]), note)
+    if res["setup"] in RANGED and b["slot"] < n_or:
         seen = [x for x in res["_bars"] if x["slot"] <= b["slot"]]
         note = "range so far %s to %s" % (rs(min(x["l"] for x in seen)), rs(max(x["h"] for x in seen)))
         if b["slot"] == n_or - 1:
@@ -775,14 +1012,18 @@ def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_err
 def _opts(a, cfg):
     if a.side in ("sell", "short"):
         raise EntryError("this pack plans longs only: no short entries. Watch for a buy (--side buy) instead.")
-    if a.setup == "orb" and a.level is not None:
+    if a.setup != "level" and a.level is not None:
         raise EntryError("--level is for --setup level (an orb's level is its range high)")
+    if a.min_bars_below < 1:
+        raise EntryError("--min-bars-below must be 1 or more")
+    if not a.gap_pct > 0:
+        raise EntryError("--gap-pct must be above 0")
     if a.min_volume_x is not None and a.min_volume_x <= 0:
         raise EntryError("--min-volume-x must be above 0")
     if a.level is not None and a.level <= 0:
         raise EntryError("--level must be a price above 0")
     return {"setup": a.setup, "or_minutes": a.or_minutes, "interval": a.interval, "level": a.level,
-            "min_volume_x": a.min_volume_x, "cfg": cfg}
+            "min_volume_x": a.min_volume_x, "cfg": cfg, "min_bars_below": a.min_bars_below, "gap_pct": a.gap_pct}
 
 
 def _load(a, sym, now):
@@ -907,11 +1148,16 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd")
 
     def common(p):
-        p.add_argument("--setup", choices=["orb", "level"], default="orb")
+        p.add_argument("--setup", choices=list(SETUPS), default="orb",
+                       help="orb (default), level, vwap (VWAP reclaim) or gap (gap and go)")
         p.add_argument("--or-minutes", type=int, default=15, help="opening range length (default 15)")
         p.add_argument("--interval", choices=["5m", "1m"], default="5m")
         p.add_argument("--level", type=float, help="the price to close above (--setup level)")
         p.add_argument("--min-volume-x", type=float, help="trigger bar volume vs the range bars' average")
+        p.add_argument("--min-bars-below", type=int, default=MIN_BARS_BELOW,
+                       help="vwap: bars in a row at or under VWAP before the reclaim (default 3)")
+        p.add_argument("--gap-pct", type=float, default=GAP_PCT,
+                       help="gap: the open is at least this percent above the previous close (default 1.0)")
         p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="buy only")
         p.add_argument("--now", help='pretend it is this India time (IST), e.g. "2026-11-23 09:45"')
         p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON (.json/.json.gz) or a folder")

@@ -25,6 +25,8 @@ SPEC_CFG = {
     "require_stop": True, "no_entries_before": "09:30", "no_entries_after": "14:30",
     "flat_by": "15:00", "broker": "groww", "paper": True, "blocked": [],
     "allow_options": False, "allow_margin": False, "allow_short": False,
+    "circuit_breaker": True, "loss_streak_limit": 3, "loss_streak_cooldown_minutes": None,
+    "reentry_cooldown_minutes": 30, "block_reentry_after_stop": True, "max_weekly_loss_inr": None,
 }
 
 

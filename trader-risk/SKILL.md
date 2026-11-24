@@ -10,11 +10,18 @@ description: >-
   trades per day, and no new entries outside your entry window (India time)
   or when NSE is closed. It also keeps the basics: blocked symbols, order
   size, position cap, cash buffer, margin, short sales, F&O contracts,
-  malformed orders, duplicates and a daily order limit. Getting out is never
-  blocked by a day limit. Prints PASS or BLOCK with the reason and records
-  the verdicts so trader-broker only shows an order that passed. Use when the
-  user says "check my order", "is this safe", "risk check", "does this break
-  my rules", "can I take this trade", "how much have I risked today", or
+  malformed orders, duplicates and a daily order limit. On top sits an
+  account-level circuit breaker that reads what really happened (the scored
+  trades in the Practice Journal, after charges) and stops NEW entries once
+  the day's realised loss reaches the daily loss limit, after a losing streak
+  (3 in a row by default), within 30 minutes of a losing exit, for a second
+  entry in a stock that was stopped out today, or at an optional weekly loss
+  limit. Getting out is never blocked by a day limit or by the breaker. Prints
+  PASS or BLOCK with the reason and records the verdicts so trader-broker only
+  shows an order that passed. Use when the user says "check my order", "is
+  this safe", "risk check", "does this break my rules", "can I take this
+  trade", "how much have I risked today", "can I still trade today", "am I on
+  a losing streak", "breaker status", "how much of my daily limit is left", or
   before /trader-broker, always.
 argument-hint: "[path to orders.json]"
 ---
@@ -37,6 +44,9 @@ python "${CLAUDE_SKILL_DIR}/check.py"                           # trader/ files;
 python "${CLAUDE_SKILL_DIR}/check.py" --json
 python "${CLAUDE_SKILL_DIR}/check.py" --no-write                # look without recording
 python "${CLAUDE_SKILL_DIR}/check.py" --now "2026-11-23 09:46"  # pin the clock (India time, IST)
+python "${CLAUDE_SKILL_DIR}/check.py" breaker                   # the circuit breaker's state now; read-only
+python "${CLAUDE_SKILL_DIR}/check.py" breaker --symbol INFY     # and whether a new entry in INFY is blocked
+python "${CLAUDE_SKILL_DIR}/check.py" breaker --real --json     # count real trades instead; as JSON
 ```
 
 ## What it reads and writes
@@ -48,6 +58,7 @@ python "${CLAUDE_SKILL_DIR}/check.py" --now "2026-11-23 09:46"  # pin the clock 
 | `trader/portfolio.json` | cash and holdings; if missing, a fresh account funded with the budget |
 | `trader/prices.json` | a fresh price raises the entry it measures risk from; also values holdings |
 | `trader/state/broker.json` | what the user took today: duplicates, trades per day, daily loss |
+| `trader/journal.json` | trader-journal's trades, read only: the scored results (net P&L after charges, exit times) feed the circuit breaker. `--journal PATH` points elsewhere; the default is `journal.json` next to the config |
 | `trader/state/risk.json` | the verdicts it writes, with a fingerprint of each exact order |
 
 There is no broker connection. "Placed" in the log means the user told
@@ -59,7 +70,8 @@ An **entry** opens or adds to a position: a buy, or a sell that would go
 short. An **exit** only reduces what you already hold. Getting out must
 always be possible, so an exit is checked for format, asset and short sales
 only. Every other rule (day limits, entry window, loss, reward:risk, blocked
-list, size, duplicates) turns into a warning for an exit, never a BLOCK.
+list, size, duplicates) turns into a warning for an exit, never a BLOCK. The
+circuit breaker does not look at exits at all.
 
 ## The checks
 
@@ -112,6 +124,55 @@ Warnings do not block, but say them to the user: LIVE mode, a stop that
 lives only in the plan and not on the order, a price too old to use, a year
 without a holiday list.
 
+## The circuit breaker
+
+The checks above look at one order and at the risk you planned. The circuit
+breaker looks at the account and at what really happened: the scored trades
+in `trader/journal.json` (trader-journal: net P&L after charges, exit times)
+and today's entries in trader-broker's log. When it trips, every NEW entry is
+blocked with a `breaker:` reason in rupees and India time. Exits are never
+blocked by it.
+
+| rule | blocks new entries when | config key (default) |
+| --- | --- | --- |
+| daily loss | today's scored trades have lost the daily loss limit or more, after charges (exactly at the limit counts); or that loss, plus the planned max loss of today's open trades, plus this order would go over it | `max_daily_loss_inr` (1500) |
+| losing streak | the last N scored trades all lost, counted across days. No new entries for the rest of the day of the last loss; with a number of minutes, until that long after the last losing exit | `loss_streak_limit` (3), `loss_streak_cooldown_minutes` (null = the rest of that day) |
+| re-entry | the last losing exit was less than M minutes ago (at exactly M minutes the entry is allowed again) | `reentry_cooldown_minutes` (30) |
+| re-entry, same stock | the stock was stopped out today: no second entry in it today | `block_reentry_after_stop` (true) |
+| weekly loss | this week's scored trades (Monday on) have lost the weekly limit or more | `max_weekly_loss_inr` (null = off) |
+
+`"circuit_breaker": false` switches all of it off; 0 or null switches one
+rule off. These keys are optional in `trader/config.json`: a key that is not
+there takes the default above.
+
+How it counts:
+
+- **Practice and real are separate.** The breaker counts trades of the mode
+  the order is in: practice trades while `"paper"` is true, real trades while
+  it is false. A practice losing streak never blocks a real order, and the
+  other way round. Every breaker line names the mode it counted.
+- **A win is a net P&L above zero after charges, a loss is below zero**, the
+  same rule as the journal's scoreboard. A trade at exactly zero ends a streak.
+- **A trade that is not scored is neither a win nor a loss.** The status says
+  how many are unscored. Today's open trades count at their planned max loss
+  (before charges), the way the daily loss check already counts them, in the
+  "still at risk" figure and in what is left of the daily limit.
+- **It only knows what the journal knows.** A simulated score is written after
+  the 15:30 close, so for the breaker to see a loss during the day, the exit
+  has to be in the journal: `journal.py score --symbol X --exit-price P
+  --exit-time HH:MM`, or a sell fill in trader-broker's log followed by
+  `journal.py import` and `journal.py score`. If the log has a sell fill today
+  that the journal has not scored, the breaker says so.
+- **No journal, or no trades of that mode in it**: the breaker passes and says
+  it has no history.
+- **Times**: the exit time in the journal. For a simulated exit that is the
+  start of the 5-minute bar that touched the stop or the target. An exit with
+  no time uses the time it was scored, or the flat-by time, and says so.
+
+A circuit breaker is discipline: it caps what a bad run can cost and stops
+the trade taken to win a loss back. It is not an edge. It does not make a
+trade win and nothing here claims it improves returns.
+
 ## Steps
 
 1. If the price may have moved since the plan, refresh it first
@@ -128,6 +189,12 @@ without a holiday list.
    until it passes again, and a verdict from an earlier day does not count today.
 5. A PASS goes to `/trader-broker`, which shows the ticket and asks the user
    for an explicit yes. The PASS is never that yes.
+6. When the user asks "can I still trade today", or after a losing exit, run
+   `check.py breaker` and read out what it says: realised today, what is
+   left of the daily limit, the streak, which rule tripped and when new
+   entries are allowed again. If the breaker blocks, do not look for a way
+   round it (another symbol, a smaller size, switching mode): the fix is to
+   wait. Only the user changes a threshold, in `trader/config.json`.
 
 ## Example: TCS on Monday 2026-11-23
 
@@ -144,6 +211,7 @@ PASS  #1 buy TCS 15 shares, entry
           before brokerage, STT and other charges
           today before this: 0 of 3 trades, ₹0 of ₹1,500 daily loss
 
+Circuit breaker (practice trades): no practice trades in the journal yet, so no history to count. It passes.
 1 passed, 0 blocked at 2026-11-23 09:46 IST. Cash after the passed orders: ₹13,347.50 (practice mode).
 Every order passed. trader-broker still asks you yes or no for each one, and you enter it in your own broker app yourself.
 Education and tooling, not financial advice.
@@ -180,6 +248,52 @@ the market is closed today (NSE holiday: Guru Nanak Jayanti, Tue 2026-11-24
 10:00 IST)`). A 14:58 sell that closes the 15 shares passes, even though it
 is after the 14:30 entry cutoff: it is an exit.
 
+## Example: the circuit breaker on Monday 2026-11-23
+
+A small practice journal, made in a temporary folder with trader-journal
+from real prices (Yahoo's `TCS.NS` and `INFY.NS` 5-minute bars of that day):
+TCS, 15 shares from 2,443.50, out at the target 2,467.65 at 10:07 (net
++₹301.87 after charges); INFY, 33 shares from 1,123.00, out at the stop
+1,114.10 at 10:57 (net -₹354.04). Both exits were reported to the journal
+with `journal.py score --exit-price ... --exit-time ...`. Then
+`check.py breaker --now "2026-11-23 11:10"`, 13 minutes after the loss:
+
+```
+Circuit breaker at 2026-11-23 11:10 IST (Mon), practice trades: TRIPPED, no new entries
+  Journal            2 practice trades: 2 scored, 0 not scored yet
+  Realised today     -₹52.17 after charges (2 scored: 1 won, 1 lost)
+  Still at risk      ₹0 planned max loss in 0 open trades today, before charges
+  Daily loss limit   ₹1,500: ₹1,447.83 left
+  This week          -₹52.17 after charges since Mon 2026-11-23 (2 scored). Weekly loss limit: off
+  Losing streak      1 in a row (limit 3)
+  Last losing exit   INFY at 10:57 IST today (-₹354.04), 13 minutes ago
+  Stopped out today  INFY (10:57)
+  Tripped            1 rule
+    - re-entry: the last losing exit (INFY, -₹354.04 after charges) was at 10:57 IST today, 13 minutes ago. No new entries until 11:27 IST today (30 minutes after a loss).
+  New entries again  from 11:27 IST on Mon 2026-11-23, inside your entry window
+It counts practice trades only, because "paper" is true in the config. Getting out is never blocked.
+A circuit breaker is discipline: it caps what a bad run can cost. It does not make a trade win or improve returns.
+Education and tooling, not financial advice.
+```
+
+Exit code 1 means tripped, 0 means clear. The TCS order from the first
+example, checked at 11:10 with that journal, is blocked by the same rule:
+
+```
+        - breaker: re-entry: the last losing exit (INFY, -₹354.04 after charges) was at 10:57 IST today, 13 minutes ago. No new entries until 11:27 IST today (30 minutes after a loss)
+
+Circuit breaker (practice trades): TRIPPED, new entries are blocked (re-entry). Detail: check.py breaker.
+0 passed, 1 blocked at 2026-11-23 11:10 IST. Cash after the passed orders: ₹50,000 (practice mode).
+```
+
+At 11:27 the cooldown is over and the same order passes (`Circuit breaker
+(practice trades): clear. Today -₹52.17 after charges, ₹1,447.83 of the
+₹1,500 daily loss limit left, losing streak 1 of 3.`). INFY stays shut for
+the day: `check.py breaker --symbol INFY --now "2026-11-23 11:30"` says
+`clear for the account, but no new entry in INFY`, with the reason
+`re-entry: INFY was stopped out today at 10:57 IST (-₹354.04 after charges).
+No second entry in INFY today.`
+
 ## Rules
 
 - A PASS only means the order may be shown to the user as a ticket. It is not a yes.
@@ -194,8 +308,8 @@ is after the 14:30 entry cutoff: it is an exit.
 ## What it never does
 
 It never places an order, never edits an order to make it pass, never
-loosens a limit, never blocks a sell that only gets the user out, and never
-treats a PASS as the user's yes.
+loosens a limit, never blocks a sell that only gets the user out, never
+writes to the journal, and never treats a PASS as the user's yes.
 
 ## What changed from the US version
 

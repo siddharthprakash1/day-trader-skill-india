@@ -5,13 +5,13 @@ import unittest
 
 from _load import ROOT
 
-# the Indian market (NSE) port: twelve skill folders
+# the Indian market (NSE) port: fourteen skill folders
 SKILLS = ["trader-scanner", "trader-news", "trader-entry", "trader-exit", "trader-timemachine",
           "trader-risk", "trader-budget", "trader-broker", "trader-alerts", "trader-analyst",
-          "trader-insider", "trader-journal"]
-ABOUT = ("12 Claude skills for day trading Indian stocks on NSE: scan the market for setups, track news and "
-         "filings, time every entry and exit, replay every outcome before you risk a rupee, and score your "
-         "practice trades after charges.")
+          "trader-insider", "trader-journal", "trader-market", "trader-backtest"]
+ABOUT = ("14 Claude skills for day trading Indian stocks on NSE: read the market's health, scan for setups, "
+         "track news and filings, time every entry and exit, replay and backtest before you risk a rupee, and "
+         "score your practice trades after charges.")
 # skills on the way to an order carry the safety block
 ORDER_PATH = ["trader-scanner", "trader-entry", "trader-exit", "trader-timemachine", "trader-budget",
               "trader-insider", "trader-risk", "trader-broker", "trader-alerts", "trader-journal"]
@@ -37,7 +37,7 @@ def every_text_file():
 
 
 class Repo(unittest.TestCase):
-    def test_twelve_skill_folders_at_the_root(self):
+    def test_fourteen_skill_folders_at_the_root(self):
         found = sorted(d for d in os.listdir(ROOT)
                        if os.path.isfile(os.path.join(ROOT, d, "SKILL.md")))
         self.assertEqual(found, sorted(SKILLS))

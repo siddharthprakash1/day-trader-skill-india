@@ -63,6 +63,13 @@ DEFAULTS = {
     "allow_options": False,
     "allow_margin": False,
     "allow_short": False,
+    # the circuit breaker trader-risk enforces (see trader-risk/SKILL.md)
+    "circuit_breaker": True,
+    "loss_streak_limit": 3,
+    "loss_streak_cooldown_minutes": None,
+    "reentry_cooldown_minutes": 30,
+    "block_reentry_after_stop": True,
+    "max_weekly_loss_inr": None,
 }
 EPS = 1e-9
 FRESH_MINUTES = 15

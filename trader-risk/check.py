@@ -12,6 +12,8 @@ a limit together are caught.
     python check.py --now "2026-11-23 09:50"        # pin the clock (India time, IST)
     python check.py --orders trader/orders.json --json
     python check.py --no-write                      # check without recording the verdicts
+    python check.py breaker                         # the circuit breaker's state now (read-only)
+    python check.py breaker --symbol TCS --json
 
 Entries and exits. An ENTRY opens or adds to a position (a buy, or a sell
 that would go short). An EXIT only reduces what you hold. Getting out must
@@ -54,7 +56,31 @@ What blocks an entry (on top):
                 time), or the market is closed (weekend, NSE holiday, outside
                 09:15 to 15:30 IST)
 
+The circuit breaker (entries only; an exit is never blocked by it). It reads
+what really happened: the scored trades in trader-journal's file
+(trader/journal.json: net P&L after charges, exit times) and the entries in
+trader/state/broker.json. It counts trades of the mode the order is in:
+practice trades while "paper" is true, real trades while it is false.
+
+  daily loss    the scored trades of today have lost max_daily_loss_inr or
+                more, after charges; or that loss plus the planned max loss
+                of today's open trades plus this one would go over it
+  losing streak the last loss_streak_limit scored trades all lost (across
+                days): no new entries for the rest of the day of the last
+                loss, or for loss_streak_cooldown_minutes after it
+  re-entry      a new entry inside reentry_cooldown_minutes of the last
+                losing exit; a second entry in a symbol that was stopped out
+                today (block_reentry_after_stop)
+  weekly loss   the scored trades of this week (Monday on) have lost
+                max_weekly_loss_inr or more (off unless you set it)
+
+A trade that is not scored yet is neither a win nor a loss; today's open
+trades count at their planned max loss. No journal, or an empty one: the
+breaker passes and says it has no history. It is discipline: it caps what a
+bad run can cost. It does not make a trade win.
+
 Rupee figures are before brokerage, STT and other charges: not modelled.
+The breaker's realised figures are the journal's net P&L, after charges.
 Exit code 0 when every order passes, 1 when any order is blocked.
 The verdicts go to trader/state/risk.json with a fingerprint of each order,
 so trader-broker only shows an order as ready if THIS exact order passed today.
@@ -75,6 +101,9 @@ DEFAULTS = {
     "no_entries_before": "09:30", "no_entries_after": "14:30", "flat_by": "15:00",
     "broker": "groww", "paper": True, "blocked": [], "allow_options": False, "allow_margin": False,
     "allow_short": False,
+    # the circuit breaker (reads trader/journal.json): see breaker_state()
+    "circuit_breaker": True, "loss_streak_limit": 3, "loss_streak_cooldown_minutes": None,
+    "reentry_cooldown_minutes": 30, "block_reentry_after_stop": True, "max_weekly_loss_inr": None,
 }
 # The pack's internal order record: the fields that identify one proposed order (its fingerprint).
 ORDER_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
@@ -313,13 +342,398 @@ def placed_today(state, today):
     return out
 
 
+# ---------------------------------------------------------------- the circuit breaker
+
+DISCIPLINE = ("A circuit breaker is discipline: it caps what a bad run can cost. It does not make a trade win "
+              "or improve returns.")
+
+
+def signed(x):
+    """-422.43 -> "-₹422.43", 301.87 -> "+₹301.87", 0 -> "₹0"."""
+    x = round(float(x), 2)
+    if abs(x) < CENT:
+        return money(0)
+    return ("+" if x > 0 else "-") + money(abs(x))
+
+
+def _paise(x):
+    return int(round(float(x) * 100))
+
+
+def _hm(text):
+    m = HHMM.match(str(text or "").strip())
+    return datetime.time(int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _day(dt):
+    return dt.strftime("%a %Y-%m-%d")
+
+
+def _plural(n, word):
+    return "%d %s" % (n, word if n == 1 else word + "s")
+
+
+def read_journal(path):
+    """trader-journal's file -> its list of trades, or None when there is no file."""
+    doc = read_json(path, "journal", required=False)
+    if doc is None:
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("trades"), list):
+        raise RiskError("%s is not a trader-journal file (no \"trades\" list)" % path)
+    return doc["trades"]
+
+
+def _scored(t):
+    r = t.get("result")
+    return t.get("status") == "scored" and isinstance(r, dict) and _f(r.get("net")) is not None
+
+
+def exit_moment(trade):
+    """When a scored trade ended, India time: (datetime, True) from its exit time, else
+    (datetime, False) from when it was scored (if that was the same day) or its flat-by time."""
+    day = datetime.date.fromisoformat(str(trade.get("date")))
+    r = trade.get("result") or {}
+    c = _hm(r.get("exit_time"))
+    if c:
+        return datetime.datetime.combine(day, c), True
+    s = parse_utc(r.get("scored_at"))
+    if s is not None and to_ist(s).date() == day:
+        return to_ist(s).replace(second=0, microsecond=0), False
+    return datetime.datetime.combine(day, _hm(trade.get("flat_by")) or datetime.time(15, 0)), False
+
+
+def next_session(moment):
+    """The first moment at or after `moment` (India time) when NSE is open."""
+    d = moment.date()
+    if trading_day(d)[0] and moment.time() < CLOSE:
+        return max(moment, datetime.datetime.combine(d, OPEN))
+    while True:
+        d += datetime.timedelta(days=1)
+        if trading_day(d)[0]:
+            return datetime.datetime.combine(d, OPEN)
+
+
+def _limit(c, key, whole=False):
+    """A breaker threshold from the config: None, "", False or 0 = off."""
+    v = c.get(key)
+    if v in (None, "", False):
+        return None
+    f = _f(v)
+    if isinstance(v, bool) or f is None or f < 0 or (whole and abs(f - round(f)) > 1e-9):
+        raise RiskError("%s must be %s (0 or null switches it off), got %r"
+                        % (key, "a whole number" if whole else "a number", v))
+    return (int(round(f)) if whole else f) or None
+
+
+def breaker_state(cfg, journal=None, state=None, now=None, today=None):
+    """The account-level circuit breaker. Pure function; reads nothing, writes nothing.
+
+    cfg      the config (missing keys fall back to DEFAULTS); "paper" picks the mode counted
+    journal  trader-journal's trades (a list, or the file's {"trades": [...]}), or None
+    state    trader-broker's log, for today's entries the journal does not hold yet
+    now      naive UTC (default: the real clock)
+
+    Counted: journal trades of the same mode (practice or real) that are scored and whose exit
+    is not after `now`. A win is a net P&L (after charges) above zero, a loss is below zero."""
+    c = dict(DEFAULTS)
+    c.update(cfg or {})
+    now_utc = now or parse_now(None)
+    now_ist = to_ist(now_utc).replace(second=0, microsecond=0)
+    today = today or now_ist.date().isoformat()
+    today_d = datetime.date.fromisoformat(today)
+    paper = bool(c.get("paper", True))
+    mode = "practice" if paper else "real"
+    daily = _limit(c, "max_daily_loss_inr")
+    weekly = _limit(c, "max_weekly_loss_inr")
+    streak_limit = _limit(c, "loss_streak_limit", whole=True)
+    streak_cool = _limit(c, "loss_streak_cooldown_minutes")
+    reentry = _limit(c, "reentry_cooldown_minutes")
+    same_symbol = bool(c.get("block_reentry_after_stop", True))
+    if isinstance(journal, dict):
+        journal = journal.get("trades")
+    trades = [t for t in (journal or []) if isinstance(t, dict)]
+    notes = []
+
+    mine, others, rows, unscored, unscored_today, later, bad = [], 0, [], 0, 0, 0, 0
+    for t in trades:
+        if bool(t.get("paper", True)) != paper:
+            others += 1
+            continue
+        mine.append(t)
+        try:
+            day = datetime.date.fromisoformat(str(t.get("date")))
+        except ValueError:
+            bad += 1
+            continue
+        if not _scored(t):
+            unscored += 1
+            unscored_today += 1 if day == today_d else 0
+            continue
+        when, exact = exit_moment(t)
+        if day > today_d or when > now_ist:
+            later += 1
+            continue
+        rows.append({"symbol": nse_symbol(t.get("symbol")), "date": day, "when": when, "exact": exact,
+                     "net": _paise(t["result"]["net"]), "outcome": str(t["result"].get("outcome") or ""),
+                     "entry_time": str(t.get("entry_time") or "")})
+    rows.sort(key=lambda x: (x["when"], x["entry_time"], x["symbol"]))
+    if bad:
+        notes.append("%s in the journal with no readable date: not counted" % _plural(bad, "trade"))
+    if later:
+        notes.append("%s in the journal ended after %s IST: not counted"
+                     % (_plural(later, "scored trade"), now_ist.strftime("%Y-%m-%d %H:%M")))
+
+    def label(x):
+        return "%s %s" % (x["symbol"], x["date"].isoformat())
+
+    def clock(dt):
+        """11:05 IST today / 11:05 IST on Mon 2026-11-23."""
+        return "%s IST %s" % (dt.strftime("%H:%M"), "today" if dt.date() == today_d else "on " + _day(dt))
+
+    # today and this week (Monday on)
+    week_from = today_d - datetime.timedelta(days=today_d.weekday())
+    rows_today = [x for x in rows if x["date"] == today_d]
+    rows_week = [x for x in rows if week_from <= x["date"] <= today_d]
+    net_today = sum(x["net"] for x in rows_today)
+    net_week = sum(x["net"] for x in rows_week)
+    lost_today, lost_week = max(-net_today, 0), max(-net_week, 0)
+
+    # today's open trades at their planned max loss: the journal's unscored trades of today, plus
+    # the entries in the broker log that the journal does not hold
+    open_risk, open_n, in_journal = 0, 0, {}
+    for t in mine:
+        if str(t.get("date")) != today:
+            continue
+        sym = nse_symbol(t.get("symbol"))
+        in_journal[sym] = in_journal.get(sym, 0) + 1
+        if _scored(t):
+            continue
+        q, e, s = _f(t.get("qty")), _f(t.get("entry")), _f(t.get("stop"))
+        open_n += 1
+        if q and e is not None and s is not None and e > s:
+            open_risk += _paise(q * (e - s))
+        else:
+            notes.append("an open %s trade in the journal has no entry, stop or quantity: its max loss is not "
+                         "counted" % sym)
+    logged, sold = {}, set()
+    for rec in (state.get("orders") or []) if isinstance(state, dict) else []:
+        if not isinstance(rec, dict) or rec_day(rec) != today:
+            continue
+        sym = nse_symbol(rec.get("symbol"))
+        if rec.get("status") == "filled" and str(rec.get("side", "")).lower() == "sell":
+            sold.add(sym)
+        if rec.get("status") == "placed" and rec_is_entry(rec) and bool(rec.get("paper", paper)) == paper:
+            logged.setdefault(sym, []).append(_f(rec.get("max_loss")))
+    for sym, losses in sorted(logged.items()):
+        extra = losses[in_journal.get(sym, 0):]
+        open_n += len(extra)
+        open_risk += sum(_paise(x) for x in extra if x is not None)
+    scored_syms = {x["symbol"] for x in rows_today}
+    for sym in sorted(sold - scored_syms):
+        notes.append("the broker log has a sell fill in %s today that the journal has not scored: the breaker "
+                     "cannot count that trade until you run trader-journal (journal.py import, then "
+                     "journal.py score)" % sym)
+
+    tripped = []
+
+    def trip(rule, reason, until):
+        tripped.append({"rule": rule, "reason": reason, "until": until.strftime("%Y-%m-%d %H:%M")})
+
+    close_today = datetime.datetime.combine(today_d, CLOSE)
+    # 1. realised loss today
+    if daily and lost_today >= _paise(daily):
+        trip("daily loss", "daily loss: %s lost today after charges (%s), at or over your %s daily loss limit. "
+             "No new entries today" % (money(lost_today / 100.0), _plural(len(rows_today), "scored %s trade" % mode),
+                                       money(daily)), close_today)
+    # 4. realised loss this week
+    if weekly and lost_week >= _paise(weekly):
+        monday = datetime.datetime.combine(week_from + datetime.timedelta(days=7), datetime.time(0, 0))
+        trip("weekly loss", "weekly loss: %s lost this week after charges (%s since %s), at or over your %s "
+             "weekly loss limit. No new entries until %s"
+             % (money(lost_week / 100.0), _plural(len(rows_week), "scored %s trade" % mode),
+                _day(week_from), money(weekly), _day(monday)), monday)
+    # 2. a losing streak: the last N scored trades all lost
+    streak = 0
+    for x in reversed(rows):
+        if x["net"] >= 0:
+            break
+        streak += 1
+    last_loss = next((x for x in reversed(rows) if x["net"] < 0), None)
+    streak_note = ""
+    if streak_limit and streak >= streak_limit:
+        last = rows[-1]
+        names = ", ".join(label(x) for x in rows[-streak_limit:])
+        head = "losing streak: your last %d scored %s trades all lost (%s). " % (streak_limit, mode, names)
+        if streak_cool is None:
+            if last["date"] == today_d:
+                trip("losing streak", head + "No new entries for the rest of today", close_today)
+            else:
+                streak_note = "the cooldown ended at the close on %s; one more loss trips it again" % _day(last["date"])
+        else:
+            until = last["when"] + datetime.timedelta(minutes=streak_cool)
+            if now_ist < until:
+                trip("losing streak", head + "No new entries until %s (%s minutes after the last losing exit at %s)"
+                     % (clock(until), _num(streak_cool), last["when"].strftime("%H:%M")), until)
+            else:
+                streak_note = "the cooldown ended at %s; one more loss trips it again" % clock(until)
+    # 3. re-entry right after a loss
+    if reentry and last_loss is not None:
+        until = last_loss["when"] + datetime.timedelta(minutes=reentry)
+        if now_ist < until:
+            ago = int((now_ist - last_loss["when"]).total_seconds() // 60)
+            trip("re-entry", "re-entry: the last losing exit (%s, %s after charges) was at %s, %s ago. No new "
+                 "entries until %s (%s minutes after a loss)"
+                 % (last_loss["symbol"], signed(last_loss["net"] / 100.0), clock(last_loss["when"]),
+                    _plural(ago, "minute"), clock(until), _num(reentry)), until)
+        if not last_loss["exact"] and last_loss["date"] == today_d:
+            notes.append("the last losing exit (%s) has no exit time in the journal: the time it was scored, or "
+                         "its flat-by time, is used" % label(last_loss))
+    stops = {}
+    if same_symbol:
+        for x in rows_today:
+            if x["outcome"] == "stop":
+                stops.setdefault(x["symbol"], {"time": x["when"].strftime("%H:%M"), "net": x["net"] / 100.0})
+
+    resume = None
+    if tripped:
+        latest = max(datetime.datetime.strptime(t["until"], "%Y-%m-%d %H:%M") for t in tripped)
+        resume = next_session(max(latest, now_ist)).strftime("%Y-%m-%d %H:%M")
+    left = None
+    if daily:
+        left = max(_paise(daily) - lost_today - open_risk, 0) / 100.0
+    return {
+        "mode": mode, "paper": paper, "now_ist": now_ist.strftime("%Y-%m-%d %H:%M"), "date": today,
+        "history": bool(mine), "journal_trades": len(mine), "scored": len(rows), "unscored": unscored,
+        "unscored_today": unscored_today, "other_mode_trades": others,
+        "today": {"scored": len(rows_today), "wins": sum(1 for x in rows_today if x["net"] > 0),
+                  "losses": sum(1 for x in rows_today if x["net"] < 0), "net": net_today / 100.0,
+                  "realised_loss": lost_today / 100.0, "open_trades": open_n, "open_risk": open_risk / 100.0},
+        "daily_limit": daily, "daily_left": left,
+        "week": {"from": week_from.isoformat(), "scored": len(rows_week), "net": net_week / 100.0,
+                 "realised_loss": lost_week / 100.0},
+        "weekly_limit": weekly,
+        "weekly_left": (max(_paise(weekly) - lost_week, 0) / 100.0) if weekly else None,
+        "streak": streak, "streak_limit": streak_limit, "streak_cooldown_minutes": streak_cool,
+        "streak_note": streak_note,
+        "last_loss": ({"symbol": last_loss["symbol"], "date": last_loss["date"].isoformat(),
+                       "time": last_loss["when"].strftime("%H:%M"), "net": last_loss["net"] / 100.0,
+                       "exact_time": last_loss["exact"],
+                       "minutes_ago": int((now_ist - last_loss["when"]).total_seconds() // 60)}
+                      if last_loss else None),
+        "reentry_cooldown_minutes": reentry, "block_reentry_after_stop": same_symbol,
+        "stopped_out_today": stops, "tripped": tripped, "resume": resume, "notes": notes,
+    }
+
+
+def breaker_reasons(b, sym=None):
+    """Why a NEW ENTRY (in `sym`) is blocked now. Empty = the breaker lets it through."""
+    out = [t["reason"] for t in b["tripped"]]
+    hit = b["stopped_out_today"].get(nse_symbol(sym)) if sym else None
+    if hit:
+        out.append("re-entry: %s was stopped out today at %s IST (%s after charges). No second entry in %s "
+                   "today" % (nse_symbol(sym), hit["time"], signed(hit["net"]), nse_symbol(sym)))
+    return out
+
+
+def breaker_line(b):
+    """One line for the check's own report."""
+    head = "Circuit breaker (%s trades): " % b["mode"]
+    if not b["history"]:
+        return head + "no %s trades in the journal yet, so no history to count. It passes." % b["mode"]
+    if b["tripped"]:
+        return head + "TRIPPED, new entries are blocked (%s). Detail: check.py breaker." % ", ".join(
+            t["rule"] for t in b["tripped"])
+    text = "clear. Today %s after charges" % signed(b["today"]["net"])
+    if b["daily_limit"]:
+        text += ", %s of the %s daily loss limit left" % (money(b["daily_left"]), money(b["daily_limit"]))
+    if b["streak_limit"]:
+        text += ", losing streak %d of %d" % (b["streak"], b["streak_limit"])
+    if b["unscored"]:
+        text += ", %d not scored yet" % b["unscored"]
+    return head + text + "."
+
+
+def breaker_report(b, symbol=None):
+    now = datetime.datetime.strptime(b["now_ist"], "%Y-%m-%d %H:%M")
+    reasons = breaker_reasons(b, symbol)
+    verdict = "TRIPPED, no new entries" if b["tripped"] else "clear"
+    if not b["tripped"] and reasons:
+        verdict = "clear for the account, but no new entry in %s" % nse_symbol(symbol)
+    lines = ["Circuit breaker at %s IST (%s), %s trades: %s" % (b["now_ist"], now.strftime("%a"), b["mode"], verdict)]
+
+    def row(name, text):
+        lines.append(("  %-18s %s" % (name, text)).rstrip())
+
+    t, w = b["today"], b["week"]
+    if not b["history"]:
+        row("Journal", "no %s trades in the journal: no history to count, so it passes" % b["mode"])
+    else:
+        text = "%s: %d scored, %d not scored yet" % (_plural(b["journal_trades"], "%s trade" % b["mode"]),
+                                                     b["scored"], b["unscored"])
+        if b["unscored"]:
+            text += " (%d from today; neither a win nor a loss until scored)" % b["unscored_today"]
+        row("Journal", text)
+    if b["other_mode_trades"]:
+        row("", "%s in the journal %s not counted here" % (
+            _plural(b["other_mode_trades"], "%s trade" % ("real" if b["paper"] else "practice")),
+            "is" if b["other_mode_trades"] == 1 else "are"))
+    row("Realised today", "%s after charges (%d scored: %d won, %d lost)" % (signed(t["net"]), t["scored"],
+                                                                             t["wins"], t["losses"]))
+    row("Still at risk", "%s planned max loss in %s today, before charges"
+        % (money(t["open_risk"]), _plural(t["open_trades"], "open trade")))
+    if b["daily_limit"]:
+        row("Daily loss limit", "%s: %s left" % (money(b["daily_limit"]), money(b["daily_left"])))
+    else:
+        row("Daily loss limit", "off (max_daily_loss_inr is not set)")
+    week = "%s after charges since %s (%d scored)" % (signed(w["net"]), _day(datetime.date.fromisoformat(w["from"])),
+                                                     w["scored"])
+    if b["weekly_limit"]:
+        row("This week", "%s. Weekly loss limit %s: %s left" % (week, money(b["weekly_limit"]),
+                                                               money(b["weekly_left"])))
+    else:
+        row("This week", week + ". Weekly loss limit: off")
+    if b["streak_limit"]:
+        text = "%d in a row (limit %d)" % (b["streak"], b["streak_limit"])
+        row("Losing streak", text + ((": " + b["streak_note"]) if b["streak_note"] else ""))
+    else:
+        row("Losing streak", "%d in a row (no limit set)" % b["streak"])
+    ll = b["last_loss"]
+    if ll:
+        same_day = ll["date"] == b["date"]
+        row("Last losing exit", "%s at %s IST %s (%s)%s"
+            % (ll["symbol"], ll["time"], "today" if same_day else "on " + _day(datetime.date.fromisoformat(ll["date"])),
+               signed(ll["net"]), (", %s ago" % _plural(ll["minutes_ago"], "minute")) if same_day else ""))
+    else:
+        row("Last losing exit", "none")
+    if b["stopped_out_today"]:
+        row("Stopped out today", ", ".join("%s (%s)" % (s, v["time"]) for s, v in sorted(b["stopped_out_today"].items())))
+    if reasons:
+        row("Tripped", _plural(len(reasons), "rule"))
+        for r in reasons:
+            lines.append("    - %s." % r)
+    else:
+        row("Tripped", "none")
+    if b["resume"]:
+        when = datetime.datetime.strptime(b["resume"], "%Y-%m-%d %H:%M")
+        row("New entries again", "from %s IST on %s, inside your entry window" % (when.strftime("%H:%M"), _day(when)))
+    for n in b["notes"]:
+        lines.append("  Note: %s." % n)
+    lines.append("It counts %s trades only, because \"paper\" is %s in the config. Getting out is never blocked."
+                 % (b["mode"], "true" if b["paper"] else "false"))
+    lines.append(DISCIPLINE)
+    lines.append("Education and tooling, not financial advice.")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- the check
 
-def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None):
+def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None,
+          journal=None):
     """Pure function. Returns {"results": [...], "pass": n, "block": n, "warnings": [...]}.
 
     now          naive UTC (default: the real clock); its India date is "today"
-    price_times  {SYM: naive UTC time of that price}; None = every price counts as fresh"""
+    price_times  {SYM: naive UTC time of that price}; None = every price counts as fresh
+    journal      trader-journal's trades, for the circuit breaker; None = no history"""
     c = dict(DEFAULTS)
     c.update(cfg or {})
     prices = {nse_symbol(k): float(v) for k, v in (prices or {}).items() if _f(v)}
@@ -343,6 +757,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             loss_today += ml
     placed_keys = {(nse_symbol(r.get("symbol")), r.get("side")) for r in done_today}
     win_reasons, win_warns = window_check(now_ist, c)
+    brk = breaker_state(c, journal, state, now_utc, today) if c.get("circuit_breaker", True) else None
     seen = set()
     results = []
     batch_entries, batch_loss = 0, 0.0
@@ -558,11 +973,22 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     later.append("daily loss: %s already at risk today plus %s for this one = %s, over your %s "
                                  "daily loss limit" % (money(used), money(max_loss), money(used + max_loss),
                                                        money(daily)))
+                elif brk and brk["today"]["realised_loss"] and not any(t["rule"] == "daily loss"
+                                                                       for t in brk["tripped"]):
+                    # what was really lost (after charges) can be more than the planned max losses
+                    lost, at_risk = brk["today"]["realised_loss"], brk["today"]["open_risk"] + batch_loss
+                    if lost + at_risk + max_loss > daily + CENT:
+                        later.append("breaker: daily loss: %s lost today after charges plus %s still at risk in "
+                                     "open trades plus %s for this one = %s, over your %s daily loss limit"
+                                     % (money(lost), money(at_risk), money(max_loss),
+                                        money(lost + at_risk + max_loss), money(daily)))
             cap_t = int(c.get("max_trades_per_day") or 0)
             if cap_t and len(entries_today) + batch_entries >= cap_t:
                 later.append("trades: %d entries taken today plus %d passed earlier in this batch, your limit "
                              "is %d a day" % (len(entries_today), batch_entries, cap_t))
             later.extend(win_reasons)
+            if brk:
+                later.extend("breaker: " + x for x in breaker_reasons(brk, sym))
             if stop and ref and risk_ps:
                 info.append("entry %s (%s), stop %s, target %s: risk %s a share"
                             % (_p(ref), REF_WORDS.get(ref_from, ref_from), _p(stop),
@@ -634,6 +1060,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         "cash_after": round(acct["cash"], 2),
         "today": {"orders_placed": count_today, "entries_placed": len(entries_today),
                   "loss_at_risk": round(loss_today, 2)},
+        "breaker": brk,
     }
 
 
@@ -663,6 +1090,10 @@ def report(res):
         for x in r["warnings"]:
             lines.append("        ~ " + x)
     lines.append("")
+    if res.get("breaker"):
+        lines.append(breaker_line(res["breaker"]))
+        for n in res["breaker"]["notes"]:
+            lines.append("  Note: %s." % n)
     lines.append("%d passed, %d blocked at %s IST. Cash after the passed orders: %s (%s)."
                  % (res["pass"], res["block"], res["now_ist"], money(res["cash_after"]),
                     "practice mode" if res["paper"] else "LIVE"))
@@ -699,19 +1130,63 @@ def load_prices(pdoc):
     return out, times
 
 
+def journal_path(explicit, config_path):
+    """--journal, else journal.json next to the config (trader/config.json -> trader/journal.json)."""
+    return explicit or os.path.join(os.path.dirname(config_path), "journal.json")
+
+
+def breaker_main(argv):
+    """check.py breaker: print the circuit breaker's state now. Reads only; writes nothing."""
+    ap = argparse.ArgumentParser(prog="check.py breaker",
+                                 description="The circuit breaker's state now (trader-risk). Read-only.")
+    ap.add_argument("--config", default="trader/config.json")
+    ap.add_argument("--journal", help="trader-journal's file (default: journal.json next to the config)")
+    ap.add_argument("--state", default="trader/state/broker.json", help="what trader-broker logged today")
+    ap.add_argument("--symbol", help="also say whether a new entry in this NSE symbol is blocked")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--practice", action="store_true", help="count practice trades (default: follows \"paper\")")
+    g.add_argument("--real", action="store_true", help="count real trades")
+    ap.add_argument("--now", help="pretend it is this India time (IST), e.g. \"2026-11-23 11:00\"")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    try:
+        now = parse_now(a.now)
+        cfg = read_json(a.config, "config", required=False) or {}
+        if a.practice or a.real:
+            cfg = dict(cfg, paper=not a.real)
+        b = breaker_state(cfg, read_journal(journal_path(a.journal, a.config)),
+                          read_json(a.state, "broker state", required=False), now)
+    except RiskError as e:
+        print("check.py: %s" % e, file=sys.stderr)
+        return 1
+    reasons = breaker_reasons(b, a.symbol)
+    if a.json:
+        print(json.dumps(dict(b, symbol=nse_symbol(a.symbol) if a.symbol else None, reasons=reasons),
+                         indent=2, ensure_ascii=False))
+    else:
+        print(breaker_report(b, a.symbol))
+    return 1 if reasons else 0
+
+
 def main(argv=None):
     for _s in (sys.stdout, sys.stderr):
         try:
             _s.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
-    ap = argparse.ArgumentParser(description="Check proposed NSE orders against your limits (trader-risk).")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "breaker":
+        return breaker_main(argv[1:])
+    ap = argparse.ArgumentParser(description="Check proposed NSE orders against your limits (trader-risk). "
+                                             "\"check.py breaker\" prints the circuit breaker's state.")
     ap.add_argument("--orders", default="trader/orders.json")
     ap.add_argument("--config", default="trader/config.json")
     ap.add_argument("--portfolio", default="trader/portfolio.json",
                     help="your account record; if missing, a fresh account funded with the budget")
     ap.add_argument("--prices", default="trader/prices.json")
     ap.add_argument("--state", default="trader/state/broker.json", help="what trader-broker logged today")
+    ap.add_argument("--journal", help="trader-journal's file, for the circuit breaker (default: journal.json "
+                                      "next to the config)")
     ap.add_argument("--now", help="pretend it is this India time (IST), e.g. \"2026-11-23 09:50\"")
     ap.add_argument("--today", help="YYYY-MM-DD (default: today in India)")
     ap.add_argument("--out", default="trader/state/risk.json", help="where the verdicts are recorded")
@@ -731,7 +1206,8 @@ def main(argv=None):
         pdoc = read_json(a.prices, "prices", required=False) or {}
         prices, times = load_prices(pdoc)
         state = read_json(a.state, "broker state", required=False)
-        res = check(orders, cfg, portfolio, prices, state, a.today, now, times)
+        journal = read_journal(journal_path(a.journal, a.config))
+        res = check(orders, cfg, portfolio, prices, state, a.today, now, times, journal)
         if pdoc.get("as_of"):
             res["prices_as_of"] = pdoc["as_of"]
         if not a.no_write:
