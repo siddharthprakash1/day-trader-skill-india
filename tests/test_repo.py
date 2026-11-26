@@ -44,7 +44,19 @@ class Repo(unittest.TestCase):
 
     def test_root_layout(self):
         root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git") and d != "trader")
-        self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "tests"] + SKILLS))
+        self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "media", "tests"] + SKILLS))
+
+    def test_readme_pictures_exist_and_say_replay(self):
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+            readme = fh.read()
+        pics = re.findall(r"\]\((media/[^)]+\.svg)\)", readme)
+        self.assertGreaterEqual(len(pics), 4)
+        self.assertIn("A replay, not a live trade.", readme)
+        for p in pics:
+            with open(os.path.join(ROOT, p), encoding="utf-8") as fh:
+                svg = fh.read()
+            self.assertIn("REPLAY of", svg, p)  # never passed off as live
+            self.assertIn("not live", svg, p)
 
     def test_frontmatter_name_and_description(self):
         for s in SKILLS:

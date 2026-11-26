@@ -19,6 +19,34 @@ all. The last step prints an order ticket in plain words and you type it
 into your own broker app (Groww, Zerodha, Upstox or any other) yourself.
 Practice mode is the default.
 
+## See it run
+
+A replay, not a live trade. After the close on Thursday 26 November 2026,
+the tools were run on that day's real Yahoo 5-minute bars as if the time
+were 9:37 AM (the `--now` flag), then scored after 3:30 PM. Every line in
+the pictures is what the tools printed, cut for length but not edited.
+
+![The whole chain on 26 Nov 2026, replayed: scan, entry, exit plan, Time Machine, size, risk check, practice journal, score and scoreboard](media/replay-2026-11-26.svg)
+
+The scan found 20 of 95 watchlist stocks above their opening range by 9:37.
+The first two in the order printed, ANGELONE and BHEL, passed every step
+and went into the practice journal. ANGELONE hit neither its stop nor its
+target and was closed at 3:00 PM for +0.47R; BHEL hit its target at 10:40
+for +2R. Net +505.76 rupees after 119.04 rupees of charges, on 2 trades:
+far too few to mean anything. The [backtest](#the-tools) of the same setup
+over 60 days and the Nifty 500 lost money after charges.
+
+<details>
+<summary>The same replay as still pictures</summary>
+
+![Opening-range scan at 9:37 AM](media/replay-2026-11-26-scan.svg)
+
+![BHEL: entry, exit plan, Time Machine, size, risk check and practice journal](media/replay-2026-11-26-trade.svg)
+
+![Scored after the close, and the scoreboard](media/replay-2026-11-26-scoreboard.svg)
+
+</details>
+
 ## Install
 
 As a plugin, in Claude Code:
@@ -267,6 +295,7 @@ trader-journal/     SKILL.md, journal.py
 trader-market/      SKILL.md, market.py
 trader-backtest/    SKILL.md, backtest.py
 tests/              unittest suite + offline fixtures
+media/              the README pictures: a recorded replay, its source text and render.py
 ```
 
 MIT. Ported to the Indian market from
